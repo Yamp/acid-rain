@@ -17,14 +17,15 @@ const LIGHT_ELEVATION: f32 = 0.8;
 const LIGHT_RADIUS: f32 = 0.3;
 const LIGHT_PERIOD: f32 = 60.0;
 
-const CAMERA_PERIOD: f32 = 210.0;    // 3.5 min full orbit
 const CAMERA_ROLL_PERIOD: f32 = 23.0;
 const CAMERA_ELEV_DEG: f32 = 70.0;   // 70° above the surface
 const CAMERA_DIST: f32 = 1.0;
 const CAMERA_FOV_DEG: f32 = 60.0;    // horizontal FOV
 const CHAR_ASPECT: f32 = 2.0;        // terminal char height / width
 const WATER_SCALE: f32 = 2.0;        // water plane size multiplier
-const WATER_MIN: f32 = 0.5 - WATER_SCALE / 2.0;
+
+const DRIFT_SPEED: f32 = 0.05;       // world units per second
+const DRIFT_TURN_PERIOD: f32 = 180.0; // heading rotation period (lazy circle)
 
 const NORMAL_STRENGTH: f32 = 15.0;
 const AMBIENT: f32 = 0.3;
@@ -49,6 +50,7 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
 
 struct Camera {
     pos: [f32; 3],
+    ground: [f32; 2],   // look-at point on z=0 (water plane center)
     fwd: [f32; 3],
     right: [f32; 3],
     up: [f32; 3],
@@ -58,16 +60,24 @@ struct Camera {
 
 impl Camera {
     fn new(elapsed: f32, sw: u16, sh: u16) -> Self {
-        let az = elapsed / CAMERA_PERIOD * 2.0 * PI;
         let el = CAMERA_ELEV_DEG.to_radians();
 
+        // Drift: heading slowly rotates → lazy circle
+        let heading = elapsed / DRIFT_TURN_PERIOD * 2.0 * PI;
+        let drift_r = DRIFT_SPEED * DRIFT_TURN_PERIOD / (2.0 * PI);
+        let ground = [
+            drift_r * heading.sin(),
+            -drift_r * heading.cos(),
+        ];
+
+        // Camera sits behind and above the ground point
         let pos = [
-            0.5 + CAMERA_DIST * az.cos() * el.cos(),
-            0.5 + CAMERA_DIST * az.sin() * el.cos(),
+            ground[0] - CAMERA_DIST * el.cos() * heading.cos(),
+            ground[1] - CAMERA_DIST * el.cos() * heading.sin(),
             CAMERA_DIST * el.sin(),
         ];
 
-        let fwd = norm3([0.5 - pos[0], 0.5 - pos[1], -pos[2]]);
+        let fwd = norm3([ground[0] - pos[0], ground[1] - pos[1], -pos[2]]);
         // right = fwd × world_up(0,0,1)  →  (fwd.y, -fwd.x, 0)
         let r0 = norm3([fwd[1], -fwd[0], 0.0]);
         let u0 = [
@@ -86,7 +96,7 @@ impl Camera {
         let half_w = (CAMERA_FOV_DEG.to_radians() * 0.5).tan();
         let half_h = half_w / aspect;
 
-        Camera { pos, fwd, right, up, half_w, half_h }
+        Camera { pos, ground, fwd, right, up, half_w, half_h }
     }
 
     /// Perspective ray direction for screen-space (u,v) in [0,1]².
@@ -106,8 +116,8 @@ impl Camera {
     fn hit_water(&self, dir: [f32; 3]) -> Option<[f32; 2]> {
         if dir[2] >= -1e-6 { return None; }
         let t = -self.pos[2] / dir[2];
-        let wx = (self.pos[0] + t * dir[0] - WATER_MIN) / WATER_SCALE;
-        let wy = (self.pos[1] + t * dir[1] - WATER_MIN) / WATER_SCALE;
+        let wx = (self.pos[0] + t * dir[0] - self.ground[0]) / WATER_SCALE + 0.5;
+        let wy = (self.pos[1] + t * dir[1] - self.ground[1]) / WATER_SCALE + 0.5;
         if wx < 0.0 || wx >= 1.0 || wy < 0.0 || wy >= 1.0 { return None; }
         Some([wx, wy])
     }
