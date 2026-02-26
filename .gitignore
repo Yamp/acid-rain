@@ -1,0 +1,11 @@
+# Rust-specific
+/target
+**/*.rs.bk
+
+# Generated files
+**/*.bk
+
+# Editor specific
+.vscode
+.idea
+*.swp
