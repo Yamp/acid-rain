@@ -24,7 +24,7 @@ const CAMERA_FOV_DEG: f32 = 60.0;    // horizontal FOV
 const CHAR_ASPECT: f32 = 2.0;        // terminal char height / width
 const WATER_SCALE: f32 = 2.0;        // water plane size multiplier
 
-const DRIFT_SPEED: f32 = 0.05;       // world units per second
+const DRIFT_SPEED: f32 = 0.15;       // world units per second
 const DRIFT_TURN_PERIOD: f32 = 180.0; // heading rotation period (lazy circle)
 
 const NORMAL_STRENGTH: f32 = 15.0;
