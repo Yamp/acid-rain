@@ -265,7 +265,10 @@ impl Renderer {
         }
 
         if !self.buf.is_empty() {
+            // Synchronized output: terminal buffers everything between these markers
+            stdout.write_all(b"\x1b[?2026h")?;
             stdout.write_all(&self.buf)?;
+            stdout.write_all(b"\x1b[?2026l")?;
             stdout.flush()?;
         }
 
