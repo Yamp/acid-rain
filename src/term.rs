@@ -204,6 +204,116 @@ fn sample_normal(levels: &Array2<f32>, wx: f32, wy: f32) -> [f32; 3] {
     [-ddx * il, -ddy * il, il]
 }
 
+// ── water shading with secondary bounce ─────────────────────────────
+
+/// Shade a water hit point. Returns HDR linear RGB.
+/// When the reflected ray points back into the water, a single secondary
+/// bounce is computed with simplified shading (diffuse + sky, no GGX/SSS).
+fn shade_water(
+    levels: &Array2<f32>,
+    elapsed: f32,
+    light: [f32; 3],
+    cam_ground: [f32; 2],
+    dir: [f32; 3],
+    wp: [f32; 2],
+) -> [f32; 3] {
+    let level = sample(levels, wp[0], wp[1]);
+    let n = sample_normal(levels, wp[0], wp[1]);
+
+    let view = [-dir[0], -dir[1], -dir[2]];
+    let cos_t = dot3(n, view).max(0.0);
+    let fr = fresnel_rgb(cos_t);
+
+    // Full 3D reflected direction: R = dir + 2·cosθ·n
+    let refl_dir = [
+        dir[0] + 2.0 * cos_t * n[0],
+        dir[1] + 2.0 * cos_t * n[1],
+        dir[2] + 2.0 * cos_t * n[2],
+    ];
+
+    // Reflection color: secondary water bounce when refl_dir points down, sky otherwise
+    let sky = if refl_dir[2] < -1e-6 {
+        // Reflected ray hits water again — secondary bounce (simplified shading)
+        let world_x = (wp[0] - 0.5) * WATER_SCALE + cam_ground[0];
+        let world_y = (wp[1] - 0.5) * WATER_SCALE + cam_ground[1];
+        let hit_z: f32 = 0.02; // approximate wave surface height above z=0
+        let t2 = hit_z / (-refl_dir[2]);
+        let wx2 = (world_x + refl_dir[0] * t2 - cam_ground[0]) / WATER_SCALE + 0.5;
+        let wy2 = (world_y + refl_dir[1] * t2 - cam_ground[1]) / WATER_SCALE + 0.5;
+
+        if wx2 >= 0.0 && wx2 < 1.0 && wy2 >= 0.0 && wy2 < 1.0 {
+            let level2 = sample(levels, wx2, wy2);
+            let n2 = sample_normal(levels, wx2, wy2);
+            let n_dot_l2 = dot3(n2, light).max(0.0);
+            let lit2 = AMBIENT + n_dot_l2 * DIFFUSE_K;
+            let wb2 = water_body_color(level2);
+
+            // Secondary reflection direction → always resolves to sky
+            let view2 = norm3([-refl_dir[0], -refl_dir[1], -refl_dir[2]]);
+            let cos_t2 = dot3(n2, view2).max(0.0);
+            let fr2 = fresnel_scalar(cos_t2);
+            let refl2 = [
+                refl_dir[0] + 2.0 * cos_t2 * n2[0],
+                refl_dir[1] + 2.0 * cos_t2 * n2[1],
+                refl_dir[2] + 2.0 * cos_t2 * n2[2],
+            ];
+            let sky2 = sky_color(elapsed, refl2);
+
+            (
+                wb2.0 * lit2 * (1.0 - fr2) + sky2.0 * fr2,
+                wb2.1 * lit2 * (1.0 - fr2) + sky2.1 * fr2,
+                wb2.2 * lit2 * (1.0 - fr2) + sky2.2 * fr2,
+            )
+        } else {
+            sky_color(elapsed, refl_dir)
+        }
+    } else {
+        sky_color(elapsed, refl_dir)
+    };
+
+    // Diffuse (Lambertian)
+    let n_dot_l = dot3(n, light).max(0.0);
+    let lit = AMBIENT + n_dot_l * DIFFUSE_K;
+
+    // Subsurface scattering
+    let sss_dir = norm3([
+        -light[0] + n[0] * SSS_DISTORTION,
+        -light[1] + n[1] * SSS_DISTORTION,
+        -light[2] + n[2] * SSS_DISTORTION,
+    ]);
+    let sss_dot = dot3(view, sss_dir).max(0.0).powf(SSS_POWER);
+    let sss = sss_dot * SSS_STRENGTH * (1.0 - fr[1]);
+
+    // Transmitted (water body + lighting + SSS, per-channel Fresnel)
+    let wb = water_body_color(level);
+    let tx = [
+        wb.0 * (lit + sss) * (1.0 - fr[0]),
+        wb.1 * (lit + sss) * (1.0 - fr[1]),
+        wb.2 * (lit + sss) * (1.0 - fr[2]),
+    ];
+
+    // Reflected (per-channel Fresnel)
+    let rf = [sky.0 * fr[0], sky.1 * fr[1], sky.2 * fr[2]];
+
+    // Cook-Torrance GGX specular (white, scalar Fresnel)
+    let hv = norm3([light[0] + view[0], light[1] + view[1], light[2] + view[2]]);
+    let n_dot_h = dot3(n, hv).max(0.0);
+    let n_dot_v = cos_t.max(0.001);
+    let a2 = GGX_ROUGHNESS * GGX_ROUGHNESS;
+    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    let d_ggx = a2 / (PI * denom * denom);
+    let k = a2 * 0.5;
+    let g1v = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    let g1l = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    let geom = g1v * g1l;
+    let fr_spec = fresnel_scalar(n_dot_h);
+    let spec_denom = 4.0 * n_dot_v * n_dot_l.max(0.001);
+    let spec = (d_ggx * fr_spec * geom / spec_denom).min(2.0);
+
+    // HDR combine
+    [tx[0] + rf[0] + spec, tx[1] + rf[1] + spec, tx[2] + rf[2] + spec]
+}
+
 // ── renderer ────────────────────────────────────────────────────────
 
 pub struct Renderer {
@@ -253,87 +363,38 @@ impl Renderer {
         self.buf.clear();
         let levels = &water.levels;
 
+        // Rotated-grid supersampling (4× RGSS) — sub-pixel offsets
+        const AA: [[f32; 2]; 4] = [
+            [0.375, 0.125], [0.875, 0.375],
+            [0.125, 0.625], [0.625, 0.875],
+        ];
+        const AA_INV: f32 = 1.0 / AA.len() as f32;
+
         for sx in 0..w {
             for sy in 0..h {
-                let u = (sx as f32 + 0.5) / w as f32;
-                let v = (sy as f32 + 0.5) / h as f32;
-                let dir = cam.ray(u, v);
+                let mut acc = [0.0_f32; 3];
 
-                let color = if let Some(wp) = cam.hit_water(dir) {
-                    let level = sample(levels, wp[0], wp[1]);
-                    let n = sample_normal(levels, wp[0], wp[1]);
+                for &[ox, oy] in &AA {
+                    let u = (sx as f32 + ox) / w as f32;
+                    let v = (sy as f32 + oy) / h as f32;
+                    let dir = cam.ray(u, v);
 
-                    // view = surface → eye = −ray
-                    let view = [-dir[0], -dir[1], -dir[2]];
-                    let cos_t = dot3(n, view).max(0.0);
+                    let hdr = if let Some(wp) = cam.hit_water(dir) {
+                        shade_water(levels, elapsed, light, cam.ground, dir, wp)
+                    } else {
+                        let s = sky_color(elapsed, dir);
+                        [s.0, s.1, s.2]
+                    };
+                    acc[0] += hdr[0];
+                    acc[1] += hdr[1];
+                    acc[2] += hdr[2];
+                }
 
-                    // Chromatic Fresnel (per-channel, Cauchy dispersion)
-                    let fr = fresnel_rgb(cos_t);
-
-                    // Full 3D reflected direction: R = dir + 2·cosθ·n
-                    let refl_dir = [
-                        dir[0] + 2.0 * cos_t * n[0],
-                        dir[1] + 2.0 * cos_t * n[1],
-                        dir[2] + 2.0 * cos_t * n[2],
-                    ];
-                    let sky = sky_color(elapsed, refl_dir);
-
-                    // Diffuse (Lambertian)
-                    let n_dot_l = dot3(n, light).max(0.0);
-                    let lit = AMBIENT + n_dot_l * DIFFUSE_K;
-
-                    // Subsurface scattering: light through the back of the wave
-                    let sss_dir = norm3([
-                        -light[0] + n[0] * SSS_DISTORTION,
-                        -light[1] + n[1] * SSS_DISTORTION,
-                        -light[2] + n[2] * SSS_DISTORTION,
-                    ]);
-                    let sss_dot = dot3(view, sss_dir).max(0.0).powf(SSS_POWER);
-                    let sss = sss_dot * SSS_STRENGTH * (1.0 - fr[1]);
-
-                    // Transmitted (water body + lighting + SSS, per-channel Fresnel)
-                    let wb = water_body_color(level);
-                    let tx = [
-                        wb.0 * (lit + sss) * (1.0 - fr[0]),
-                        wb.1 * (lit + sss) * (1.0 - fr[1]),
-                        wb.2 * (lit + sss) * (1.0 - fr[2]),
-                    ];
-
-                    // Reflected sky (per-channel Fresnel)
-                    let rf = [sky.0 * fr[0], sky.1 * fr[1], sky.2 * fr[2]];
-
-                    // Cook-Torrance GGX specular (white, scalar Fresnel)
-                    let hv = norm3([light[0] + view[0], light[1] + view[1], light[2] + view[2]]);
-                    let n_dot_h = dot3(n, hv).max(0.0);
-                    let n_dot_v = cos_t.max(0.001);
-                    let a2 = GGX_ROUGHNESS * GGX_ROUGHNESS;
-                    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-                    let d_ggx = a2 / (PI * denom * denom);
-                    let k = a2 * 0.5;
-                    let g1v = n_dot_v / (n_dot_v * (1.0 - k) + k);
-                    let g1l = n_dot_l / (n_dot_l * (1.0 - k) + k);
-                    let geom = g1v * g1l;
-                    let fr_spec = fresnel_scalar(n_dot_h);
-                    let spec_denom = 4.0 * n_dot_v * n_dot_l.max(0.001);
-                    let spec = (d_ggx * fr_spec * geom / spec_denom).min(2.0);
-
-                    // HDR combine → ACES tone map → sRGB gamma
-                    let hdr_r = tx[0] + rf[0] + spec;
-                    let hdr_g = tx[1] + rf[1] + spec;
-                    let hdr_b = tx[2] + rf[2] + spec;
-
-                    let r = (linear_to_srgb(aces_tonemap(hdr_r)) * 255.0) as u8;
-                    let g = (linear_to_srgb(aces_tonemap(hdr_g)) * 255.0) as u8;
-                    let b = (linear_to_srgb(aces_tonemap(hdr_b)) * 255.0) as u8;
-                    (r, g, b)
-                } else {
-                    // Sky pixel
-                    let sky = sky_color(elapsed, dir);
-                    let r = (linear_to_srgb(aces_tonemap(sky.0)) * 255.0) as u8;
-                    let g = (linear_to_srgb(aces_tonemap(sky.1)) * 255.0) as u8;
-                    let b = (linear_to_srgb(aces_tonemap(sky.2)) * 255.0) as u8;
-                    (r, g, b)
-                };
+                let color = (
+                    (linear_to_srgb(aces_tonemap(acc[0] * AA_INV)) * 255.0) as u8,
+                    (linear_to_srgb(aces_tonemap(acc[1] * AA_INV)) * 255.0) as u8,
+                    (linear_to_srgb(aces_tonemap(acc[2] * AA_INV)) * 255.0) as u8,
+                );
 
                 let idx = sx as usize * h as usize + sy as usize;
                 if self.prev_colors[idx] != color {
