@@ -48,9 +48,9 @@ pub fn water_body_color(value: f32) -> (f32, f32, f32) {
     let t = t_lin * t_lin.sqrt();
 
     let (hue, sat, val) = if value >= 0.0 {
-        (200.0 - t * 5.0, 0.6 + t * 0.3, 0.65 + t * 0.3)
+        (195.0 - t * 10.0, 0.7 + t * 0.25, 0.7 + t * 0.28)
     } else {
-        (215.0 - t * 15.0, 0.4 + t * 0.5, 0.55 + t * 0.3)
+        (220.0 - t * 20.0, 0.55 + t * 0.4, 0.6 + t * 0.3)
     };
 
     hsv_to_linear(hue, sat, val)
@@ -74,8 +74,8 @@ pub fn sky_color(elapsed: f32, dir: [f32; 3]) -> (f32, f32, f32) {
         + elevation * 60.0;
     let hue = ((hue % 360.0) + 360.0) % 360.0;
 
-    let sat = 0.6 + elevation * 0.15 + 0.04 * (phase * 1.5).sin();
-    let val = 0.88 + 0.07 * phase.cos();
+    let sat = 0.75 + elevation * 0.15 + 0.05 * (phase * 1.5).sin();
+    let val = 0.92 + 0.06 * phase.cos();
 
     hsv_to_linear(hue, sat.max(0.0), val.clamp(0.0, 1.0))
 }

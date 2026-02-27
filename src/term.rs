@@ -675,7 +675,7 @@ struct ColorGrade {
 }
 
 const PRESETS: &[ColorGrade] = &[
-    ColorGrade { name: "default",   exposure: 1.0,  contrast: 1.0,  saturation: 1.0,  gain: [1.0, 1.0, 1.0],   hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "default",   exposure: 1.05, contrast: 1.1,  saturation: 1.35, gain: [1.0, 1.0, 1.0],   hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "storm",     exposure: 0.85, contrast: 1.25, saturation: 0.55, gain: [0.82, 0.9, 1.08], hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "neon",      exposure: 1.05, contrast: 1.3,  saturation: 1.5,  gain: [1.05, 0.85, 1.15],hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "moonlight", exposure: 0.55, contrast: 0.85, saturation: 0.25, gain: [0.7, 0.82, 1.3],  hue_speed: 0.0, breathe: 0.0 },
