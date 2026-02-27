@@ -59,6 +59,10 @@ const R0_B: f32 = 0.35;
 const SSS_STRENGTH: f32 = 0.15;
 const SSS_DISTORTION: f32 = 0.3;
 
+// Toxic emission (bioluminescence / radioactive glow)
+const EMIT_STRENGTH: f32 = 0.08;      // base emission intensity
+const EMIT_COLOR: [f32; 3] = [0.15, 1.0, 0.6]; // acid green-cyan
+
 // ── flat f32 casts for SIMD-friendly bulk passes ────────────────────
 // [f32; 3] is 3 contiguous f32s with no padding → safe to reinterpret.
 #[inline(always)]
@@ -69,7 +73,6 @@ fn as_flat(buf: &[[f32; 3]]) -> &[f32] {
 fn as_flat_mut(buf: &mut [[f32; 3]]) -> &mut [f32] {
     unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, buf.len() * 3) }
 }
-
 // Auto-exposure (eye adaptation)
 const AUTO_EXP_SPEED: f32 = 1.5;      // adaptation rate (1/seconds — higher = faster)
 const AUTO_EXP_TARGET: f32 = 0.25;    // target geometric-mean luminance
@@ -606,12 +609,24 @@ fn shade_water(
         (1.0 - fr_v[2]) * wb.2 * sss_val,
     ];
 
+    // ── Toxic emission: bioluminescent glow from within the water ──
+    // Stronger on wave crests (positive level) and steep slopes (high slope_var).
+    // Transmitted through surface: attenuated by (1 - F_v).
+    let emit_wave = level.max(0.0) * 4.0;           // crests glow brighter
+    let emit_slope = (slope_var * 2.0).min(1.0);     // agitated water glows more
+    let emit_i = EMIT_STRENGTH * (0.3 + 0.5 * emit_wave + 0.2 * emit_slope);
+    let emit = [
+        (1.0 - fr_v[0]) * EMIT_COLOR[0] * emit_i,
+        (1.0 - fr_v[1]) * EMIT_COLOR[1] * emit_i,
+        (1.0 - fr_v[2]) * EMIT_COLOR[2] * emit_i,
+    ];
+
     // ── Combine ──
-    // env × F_v + specular (F_h inside) + diffuse + caustics + ambient + SSS
+    // env × F_v + specular (F_h inside) + diffuse + caustics + ambient + SSS + emission
     [
-        env.0 * fr_v[0] + direct_spec[0] + direct_diff[0] + caustic_term[0] + ambient_tx[0] + sss_term[0],
-        env.1 * fr_v[1] + direct_spec[1] + direct_diff[1] + caustic_term[1] + ambient_tx[1] + sss_term[1],
-        env.2 * fr_v[2] + direct_spec[2] + direct_diff[2] + caustic_term[2] + ambient_tx[2] + sss_term[2],
+        env.0 * fr_v[0] + direct_spec[0] + direct_diff[0] + caustic_term[0] + ambient_tx[0] + sss_term[0] + emit[0],
+        env.1 * fr_v[1] + direct_spec[1] + direct_diff[1] + caustic_term[1] + ambient_tx[1] + sss_term[1] + emit[1],
+        env.2 * fr_v[2] + direct_spec[2] + direct_diff[2] + caustic_term[2] + ambient_tx[2] + sss_term[2] + emit[2],
     ]
 }
 

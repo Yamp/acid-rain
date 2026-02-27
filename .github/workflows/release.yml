@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_name: linux
+            bin_path: target/release/acid-rain
+          - os: macos-latest
+            target_name: macos
+            bin_path: target/release/acid-rain
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bin_path }}" "dist/acid-rain"
+          chmod +x dist/acid-rain
+          tar -czf "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.tar.gz" -C dist acid-rain
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acid-rain-${{ matrix.target_name }}
+          path: acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
