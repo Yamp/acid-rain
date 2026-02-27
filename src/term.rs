@@ -670,19 +670,29 @@ struct ColorGrade {
     contrast: f32,
     saturation: f32,
     gain: [f32; 3],
+    hue_speed: f32,   // hue rotation, degrees per second (0 = off)
+    breathe: f32,     // sinusoidal exposure amplitude (0 = off)
 }
 
 const PRESETS: &[ColorGrade] = &[
-    ColorGrade { name: "default",   exposure: 1.0,  contrast: 1.0,  saturation: 1.0,  gain: [1.0, 1.0, 1.0] },
-    ColorGrade { name: "storm",     exposure: 0.85, contrast: 1.25, saturation: 0.55, gain: [0.82, 0.9, 1.08] },
-    ColorGrade { name: "neon",      exposure: 1.05, contrast: 1.3,  saturation: 1.5,  gain: [1.05, 0.85, 1.15] },
-    ColorGrade { name: "moonlight", exposure: 0.55, contrast: 0.85, saturation: 0.25, gain: [0.7, 0.82, 1.3] },
+    ColorGrade { name: "default",   exposure: 1.0,  contrast: 1.0,  saturation: 1.0,  gain: [1.0, 1.0, 1.0],   hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "storm",     exposure: 0.85, contrast: 1.25, saturation: 0.55, gain: [0.82, 0.9, 1.08], hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "neon",      exposure: 1.05, contrast: 1.3,  saturation: 1.5,  gain: [1.05, 0.85, 1.15],hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "moonlight", exposure: 0.55, contrast: 0.85, saturation: 0.25, gain: [0.7, 0.82, 1.3],  hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "acid",      exposure: 1.15, contrast: 1.35, saturation: 2.2,  gain: [1.05, 0.95, 1.15],hue_speed: 25.0, breathe: 0.2 },
 ];
 
 /// Tonemap + color grade → sRGB [0,1] (ready for dither + quantize).
 #[inline(always)]
-fn apply_grade(hdr: [f32; 3], g: &ColorGrade, auto_exp: f32) -> [f32; 3] {
-    let exp = g.exposure * auto_exp;
+fn apply_grade(hdr: [f32; 3], g: &ColorGrade, auto_exp: f32, elapsed: f32) -> [f32; 3] {
+    // breathing: sinusoidal exposure pulsation
+    let breath = if g.breathe > 0.0 {
+        1.0 + g.breathe * (elapsed * 0.8 * PI).sin()
+            * (1.0 + 0.3 * (elapsed * 0.31 * PI).sin()) // second harmonic for organic feel
+    } else {
+        1.0
+    };
+    let exp = g.exposure * auto_exp * breath;
     let mut r = aces_tonemap(hdr[0] * exp);
     let mut gv = aces_tonemap(hdr[1] * exp);
     let mut b = aces_tonemap(hdr[2] * exp);
@@ -697,6 +707,16 @@ fn apply_grade(hdr: [f32; 3], g: &ColorGrade, auto_exp: f32) -> [f32; 3] {
     r = luma + (r - luma) * g.saturation;
     gv = luma + (gv - luma) * g.saturation;
     b = luma + (b - luma) * g.saturation;
+
+    // hue rotation (Rodrigues around luminance axis in RGB)
+    if g.hue_speed != 0.0 {
+        let a = elapsed * g.hue_speed * (PI / 180.0);
+        let (s, c) = a.sin_cos();
+        let rn = r*(0.213 + 0.787*c - 0.213*s) + gv*(0.715 - 0.715*c - 0.715*s) + b*(0.072 - 0.072*c + 0.928*s);
+        let gn = r*(0.213 - 0.213*c + 0.143*s) + gv*(0.715 + 0.285*c + 0.140*s) + b*(0.072 - 0.072*c - 0.283*s);
+        let bn = r*(0.213 - 0.213*c - 0.787*s) + gv*(0.715 - 0.715*c + 0.715*s) + b*(0.072 + 0.928*c + 0.072*s);
+        r = rn; gv = gn; b = bn;
+    }
 
     // tint
     [
@@ -1022,8 +1042,8 @@ impl Renderer {
                 let bot_hdr = self.reproject_blend(
                     cur_bot, &cam, sx as f32, (sy * 2 + 1) as f32, w_f, vh_f, w_us, vh_us);
 
-                let ts = apply_grade(top_hdr, grade, auto_exp);
-                let bs = apply_grade(bot_hdr, grade, auto_exp);
+                let ts = apply_grade(top_hdr, grade, auto_exp, elapsed);
+                let bs = apply_grade(bot_hdr, grade, auto_exp, elapsed);
                 let dt = ign(sx as f32, (sy * 2) as f32, frame_f);
                 let db = ign(sx as f32, (sy * 2 + 1) as f32, frame_f);
 
