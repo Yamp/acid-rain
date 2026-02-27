@@ -1,2 +1,2 @@
-cargo build --release
-cargo run --release
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+RUSTFLAGS="-C target-cpu=native" cargo run --release

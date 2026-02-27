@@ -1,8 +1,21 @@
+/// Fast approximate power via IEEE 754 bit manipulation (~5-12% relative error).
+#[inline(always)]
+pub fn fast_powf(x: f32, p: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    const MAGIC: f32 = 1065353216.0; // 127.0 * 2^23
+    let i = x.to_bits() as f32;
+    f32::from_bits(((i - MAGIC) * p + MAGIC) as u32)
+}
+
 /// sRGB → linear conversion for physically correct lighting
 #[inline(always)]
 fn srgb_to_linear(c: f32) -> f32 {
-    // Gamma‑2.0 approximation — avoids powf in the hot path
-    c * c
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        let x = (c + 0.055) * (1.0 / 1.055);
+        fast_powf(x, 2.4)
+    }
 }
 
 /// HSV → linear RGB (no u8 quantization).

@@ -1,4 +1,4 @@
-use crate::colors::{sky_color, water_body_color};
+use crate::colors::{fast_powf, sky_color, water_body_color};
 use anyhow::Result;
 use crossterm::style::Color;
 use crossterm::{cursor, queue, style, terminal};
@@ -25,12 +25,12 @@ const DRIFT_TURN_PERIOD: f32 = 180.0; // heading rotation period (lazy circle)
 
 const FOG_DENSITY: f32 = 0.08;
 
-const TAA_KEEP: f32 = 0.20;
+const TAA_KEEP: f32 = 0.25;
 const TAA_NEW: f32 = 1.0 - TAA_KEEP;
 
 const CA_STRENGTH: f32 = 0.004; // chromatic aberration — max UV shift at corners
 
-const GOD_RAY_SAMPLES: usize = 16;
+const GOD_RAY_SAMPLES: usize = 8;
 const GOD_RAY_DECAY: f32 = 0.96;
 const GOD_RAY_DENSITY: f32 = 0.5;
 const GOD_RAY_EXPOSURE: f32 = 0.12;
@@ -63,9 +63,10 @@ const SSS_DISTORTION: f32 = 0.3;
 
 #[inline(always)]
 fn norm3(v: [f32; 3]) -> [f32; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l < 1e-10 { return [0.0, 0.0, 1.0]; }
-    [v[0] / l, v[1] / l, v[2] / l]
+    let l2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if l2 < 1e-20 { return [0.0, 0.0, 1.0]; }
+    let il = 1.0 / l2.sqrt(); // rsqrt pattern: 1 div + 3 muls instead of 3 divs
+    [v[0] * il, v[1] * il, v[2] * il]
 }
 
 #[inline(always)]
@@ -78,7 +79,9 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
 #[inline(always)]
 fn fresnel_rgb(cos_theta: f32) -> [f32; 3] {
     let ct = cos_theta.max(0.0);
-    let omc = (1.0 - ct).powi(5);
+    let x = 1.0 - ct;
+    let x2 = x * x;
+    let omc = x2 * x2 * x;
     [
         R0_R + (1.0 - R0_R) * omc,
         R0_G + (1.0 - R0_G) * omc,
@@ -89,7 +92,9 @@ fn fresnel_rgb(cos_theta: f32) -> [f32; 3] {
 #[inline(always)]
 fn fresnel_scalar(cos_theta: f32) -> f32 {
     let r0 = (R0_R + R0_G + R0_B) / 3.0;
-    let omc = (1.0 - cos_theta.max(0.0)).powi(5);
+    let x = 1.0 - cos_theta.max(0.0);
+    let x2 = x * x;
+    let omc = x2 * x2 * x;
     r0 + (1.0 - r0) * omc
 }
 
@@ -106,8 +111,11 @@ fn aces_tonemap(x: f32) -> f32 {
 
 #[inline(always)]
 fn linear_to_srgb(c: f32) -> f32 {
-    // Gamma‑2.0 approximation — sqrt instead of powf(1/2.4)
-    c.sqrt()
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * fast_powf(c, 1.0 / 2.4) - 0.055
+    }
 }
 
 // ── interleaved gradient noise (Jimenez 2014) ──────────────────────
@@ -572,8 +580,8 @@ fn shade_water(
         -light[1] + n[1] * SSS_DISTORTION,
         -light[2] + n[2] * SSS_DISTORTION,
     ]);
-    let sss_dot_base = dot3(view, sss_dir).max(0.0);
-    let sss_dot = sss_dot_base * sss_dot_base * sss_dot_base; // x³ — avoids powf
+    let sss_dot = dot3(view, sss_dir).max(0.0);
+    let sss_dot = sss_dot * sss_dot * sss_dot; // cube (SSS_POWER = 3.0)
     let sss_val = sss_dot * SSS_STRENGTH;
     let sss_term = [
         (1.0 - fr_v[0]) * wb.0 * sss_val,
@@ -823,42 +831,30 @@ impl Renderer {
         precompute_laplacian(levels, &mut self.lap_grid);
         precompute_sky(elapsed, &mut self.sky_envmap);
 
-        // ── pass 1: shade into HDR buffer (4× RGSS, no CA yet) ──
-        // RGSS offsets (rotated grid for best coverage)
-        const RGSS: [(f32, f32); 4] = [
-            (-3.0/8.0,  1.0/8.0),
-            ( 1.0/8.0,  3.0/8.0),
-            ( 3.0/8.0, -1.0/8.0),
-            (-1.0/8.0, -3.0/8.0),
+        // ── pass 1: shade into HDR buffer (1× + TAA jitter) ──
+        // Halton(2,3) sub-pixel jitter replaces 4× RGSS; TAA accumulates temporally
+        const TAA_JITTER: [(f32, f32); 8] = [
+            ( 0.0,    -0.1667),
+            (-0.25,    0.1667),
+            ( 0.25,   -0.3889),
+            (-0.375,  -0.0556),
+            ( 0.125,   0.2778),
+            (-0.125,  -0.2778),
+            ( 0.375,   0.0556),
+            (-0.4375,  0.3889),
         ];
-        for sy in 0..h {
-            for sx in 0..w {
-                let sy2 = sy as usize * 2;
-                let sx_us = sx as usize;
-
-                for (vi, vrow) in [(sy2, 0.0_f32), (sy2 + 1, 1.0_f32)] {
-                    let vc_center = (sy as f32 * 2.0 + vrow + 0.5) / vh_f;
-                    let uc_center = (sx as f32 + 0.5) / w_f;
-
-                    let mut accum = [0.0_f32; 3];
-
-                    for &(ox, oy) in &RGSS {
-                        let uc = uc_center + ox / w_f;
-                        let vc = vc_center + oy / vh_f;
-                        let c = shade_ray(&cam, levels,
-                            &self.normal_grid, &self.lap_grid, &self.sky_envmap,
-                            gw, gh, light, uc, vc);
-                        accum[0] += c[0];
-                        accum[1] += c[1];
-                        accum[2] += c[2];
-                    }
-
-                    self.hdr_buf[vi * w_us + sx_us] = [
-                        accum[0] * 0.25,
-                        accum[1] * 0.25,
-                        accum[2] * 0.25,
-                    ];
-                }
+        let jitter = TAA_JITTER[self.frame as usize % TAA_JITTER.len()];
+        let inv_w = 1.0 / w_f;
+        let inv_vh = 1.0 / vh_f;
+        for vy in 0..vh_us {
+            let vc = (vy as f32 + 0.5 + jitter.1) * inv_vh;
+            let row_off = vy * w_us;
+            for sx in 0..w_us {
+                let uc = (sx as f32 + 0.5 + jitter.0) * inv_w;
+                self.hdr_buf[row_off + sx] = shade_ray(
+                    &cam, levels,
+                    &self.normal_grid, &self.lap_grid, &self.sky_envmap,
+                    gw, gh, light, uc, vc);
             }
         }
 

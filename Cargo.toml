@@ -1,5 +1,3 @@
-cargo-features = ["profile-rustflags"]
-
 [package]
 name = "acid-rain"
 version = "0.1.0"
@@ -33,7 +31,4 @@ lto = true
 opt-level = 3
 overflow-checks = false  # Disable integer overflow checks.
 panic = "unwind"
-rustflags = [
-  "-C",
-  "target-cpu=native"
-]
+# rustflags requires nightly cargo-features; use RUSTFLAGS env var instead

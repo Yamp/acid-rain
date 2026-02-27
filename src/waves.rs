@@ -2,6 +2,14 @@ use std::f32::consts::PI;
 
 use crate::settings::SETTINGS;
 
+/// Fast exp approximation via IEEE 754 bit manipulation.
+#[inline(always)]
+fn fast_exp(x: f32) -> f32 {
+    // 2^23 / ln(2) ≈ 12102203.0; 127 * 2^23 = 1065353216.0
+    let v = 12102203.0f32 * x + 1065353216.0;
+    f32::from_bits(v.max(0.0) as u32)
+}
+
 pub fn calculate_wave_level(
     initial_strength: f32,
     secs_since_disturbance: f32,
@@ -28,14 +36,16 @@ pub fn calculate_wave_level(
     let dist_attenuation = 1.0 / (radius * 8.0 + 1.0).sqrt();
 
     // Suppress amplitude near the drop center — smooth Gaussian fade, no hard edge
-    let center_fade = 1.0 - (-(radius * 15.0).powi(2)).exp();
+    let r15 = radius * 15.0;
+    let center_fade = 1.0 - fast_exp(-r15 * r15);
 
     // Wavefront envelope: x²·exp(1−x²) — zero at front, smooth peak, natural decay
     let behind_front = wavefront - radius;
     let wavelength = 1.0 / SETTINGS.waves_in_screen;
     let peak_dist = wavelength * 1.5;
     let bw = behind_front / peak_dist;
-    let envelope = bw * bw * (1.0 - bw * bw).exp();
+    let bw2 = bw * bw;
+    let envelope = bw2 * fast_exp(1.0 - bw2);
 
     let amplitude = initial_strength * time_attenuation * dist_attenuation * envelope * center_fade;
 
