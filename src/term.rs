@@ -59,6 +59,17 @@ const R0_B: f32 = 0.35;
 const SSS_STRENGTH: f32 = 0.15;
 const SSS_DISTORTION: f32 = 0.3;
 
+// ── flat f32 casts for SIMD-friendly bulk passes ────────────────────
+// [f32; 3] is 3 contiguous f32s with no padding → safe to reinterpret.
+#[inline(always)]
+fn as_flat(buf: &[[f32; 3]]) -> &[f32] {
+    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() * 3) }
+}
+#[inline(always)]
+fn as_flat_mut(buf: &mut [[f32; 3]]) -> &mut [f32] {
+    unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, buf.len() * 3) }
+}
+
 // Auto-exposure (eye adaptation)
 const AUTO_EXP_SPEED: f32 = 1.5;      // adaptation rate (1/seconds — higher = faster)
 const AUTO_EXP_TARGET: f32 = 0.25;    // target geometric-mean luminance
@@ -924,13 +935,12 @@ impl Renderer {
         self.hdr_buf[..total].copy_from_slice(&self.bloom_b[..total]);
 
         // ── pass 2: bloom — extract bright, separable gaussian blur, add back ──
-        for i in 0..total {
-            let h = self.hdr_buf[i];
-            self.bloom_a[i] = [
-                (h[0] - BLOOM_THRESHOLD).max(0.0),
-                (h[1] - BLOOM_THRESHOLD).max(0.0),
-                (h[2] - BLOOM_THRESHOLD).max(0.0),
-            ];
+        {
+            let hdr = as_flat(&self.hdr_buf[..total]);
+            let bloom = as_flat_mut(&mut self.bloom_a[..total]);
+            for i in 0..total * 3 {
+                bloom[i] = (hdr[i] - BLOOM_THRESHOLD).max(0.0);
+            }
         }
         // ── pass 2b: god rays — radial blur of bright extraction toward sun ──
         if let Some((sun_u, sun_v)) = cam.project_dir(light) {
@@ -963,11 +973,12 @@ impl Renderer {
                     ];
                 }
             }
-            for i in 0..total {
-                let g = self.bloom_b[i];
-                self.hdr_buf[i][0] += g[0];
-                self.hdr_buf[i][1] += g[1];
-                self.hdr_buf[i][2] += g[2];
+            {
+                let hdr = as_flat_mut(&mut self.hdr_buf[..total]);
+                let god = as_flat(&self.bloom_b[..total]);
+                for i in 0..total * 3 {
+                    hdr[i] += god[i];
+                }
             }
         }
 
@@ -999,11 +1010,12 @@ impl Renderer {
             }
         }
         // add bloom back
-        for i in 0..total {
-            let b = self.bloom_a[i];
-            self.hdr_buf[i][0] += b[0] * BLOOM_INTENSITY;
-            self.hdr_buf[i][1] += b[1] * BLOOM_INTENSITY;
-            self.hdr_buf[i][2] += b[2] * BLOOM_INTENSITY;
+        {
+            let hdr = as_flat_mut(&mut self.hdr_buf[..total]);
+            let bloom = as_flat(&self.bloom_a[..total]);
+            for i in 0..total * 3 {
+                hdr[i] += bloom[i] * BLOOM_INTENSITY;
+            }
         }
 
         // ── auto-exposure: measure log-average luminance, adapt smoothly ──
@@ -1029,12 +1041,15 @@ impl Renderer {
         let grade = &PRESETS[self.preset_idx];
         let frame_f = self.frame as f32;
         self.frame = self.frame.wrapping_add(1);
-        for sx in 0..w {
-            for sy in 0..h {
-                let sy2 = sy as usize * 2;
+        for sy in 0..h {
+            let sy2 = sy as usize * 2;
+            let row_top = sy2 * w_us;
+            let row_bot = (sy2 + 1) * w_us;
+            let prev_row = sy as usize * w_us;
+            for sx in 0..w {
                 let sx_us = sx as usize;
-                let cur_top = self.hdr_buf[sy2 * w_us + sx_us];
-                let cur_bot = self.hdr_buf[(sy2 + 1) * w_us + sx_us];
+                let cur_top = self.hdr_buf[row_top + sx_us];
+                let cur_bot = self.hdr_buf[row_bot + sx_us];
 
                 // Reprojected TAA for each virtual half
                 let top_hdr = self.reproject_blend(
@@ -1058,7 +1073,7 @@ impl Renderer {
                     (bs[2] * 255.0 + db).clamp(0.0, 255.0) as u8,
                 );
 
-                let idx = sx_us * h as usize + sy as usize;
+                let idx = prev_row + sx_us;
                 let pair = (top, bottom);
                 if self.prev_colors[idx] != pair {
                     self.prev_colors[idx] = pair;

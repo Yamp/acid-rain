@@ -63,7 +63,9 @@ impl Water {
         let inv_h = 1.0 / h as f32;
         let att_secs = SETTINGS.attenuation_time.as_secs_f32();
 
-        self.levels.fill(0.0);
+        // Use raw slice: avoids ndarray indexing overhead in hot loop
+        let levels = self.levels.as_slice_mut().unwrap();
+        levels.fill(0.0);
 
         for wc in &self.wave_centers {
             let delta = (self.time - wc.time).as_secs_f32();
@@ -78,6 +80,7 @@ impl Water {
             }
 
             let wavefront = delta * SETTINGS.wave_speed;
+            let wavefront2 = wavefront * wavefront;
 
             // Bounding box in pixel coords — only iterate pixels within wavefront
             let x_min = ((wc.x - wavefront) * w as f32).floor().max(0.0) as usize;
@@ -89,12 +92,14 @@ impl Water {
                 let nx = x as f32 * inv_w;
                 let dx = nx - wc.x;
                 let dx2 = dx * dx;
+                let row_off = x * h;
                 for y in y_min..y_max {
                     let ny = y as f32 * inv_h;
                     let dy = ny - wc.y;
-                    let dist = (dx2 + dy * dy).sqrt();
-                    if dist <= wavefront {
-                        self.levels[(x, y)] += calculate_wave_level(
+                    let dist2 = dx2 + dy * dy;
+                    if dist2 <= wavefront2 {
+                        let dist = dist2.sqrt();
+                        levels[row_off + y] += calculate_wave_level(
                             wc.strength, delta, dist, att_secs,
                         );
                     }
@@ -103,7 +108,7 @@ impl Water {
         }
 
         // Soft compression: linear for small amplitudes, saturates for large overlaps
-        for level in self.levels.iter_mut() {
+        for level in levels.iter_mut() {
             *level = *level / (1.0 + level.abs() * 1.5);
         }
     }
