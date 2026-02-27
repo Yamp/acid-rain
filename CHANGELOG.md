@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-02-27
+
+### Added
+- Windows binary in GitHub Release artifacts.
+
 ## [0.1.1] - 2026-02-27
 
 ### Added

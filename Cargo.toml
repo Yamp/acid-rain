@@ -1,6 +1,6 @@
 [package]
 name = "acid-rain"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["yampolson <https://github.com/Yamp>"]
 edition = "2021"
 description = "Emulate screensaver."

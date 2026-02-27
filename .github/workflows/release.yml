@@ -19,9 +19,18 @@ jobs:
           - os: ubuntu-latest
             target_name: linux
             bin_path: target/release/acid-rain
+            bin_name: acid-rain
+            archive_ext: tar.gz
           - os: macos-latest
             target_name: macos
             bin_path: target/release/acid-rain
+            bin_name: acid-rain
+            archive_ext: tar.gz
+          - os: windows-latest
+            target_name: windows
+            bin_path: target/release/acid-rain.exe
+            bin_name: acid-rain.exe
+            archive_ext: zip
 
     steps:
       - name: Checkout
@@ -33,18 +42,28 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package archive
+      - name: Package archive (Linux/macOS)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.bin_path }}" "dist/acid-rain"
-          chmod +x dist/acid-rain
-          tar -czf "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.tar.gz" -C dist acid-rain
+          cp "${{ matrix.bin_path }}" "dist/${{ matrix.bin_name }}"
+          chmod +x "dist/${{ matrix.bin_name }}"
+          tar -czf "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -C dist "${{ matrix.bin_name }}"
+
+      - name: Package archive (Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "${{ matrix.bin_path }}" "dist/${{ matrix.bin_name }}"
+          Compress-Archive -Path "dist/${{ matrix.bin_name }}" -DestinationPath "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: acid-rain-${{ matrix.target_name }}
-          path: acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.tar.gz
+          path: acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
   release:
@@ -60,5 +79,7 @@ jobs:
       - name: Publish release with assets
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
           generate_release_notes: true
