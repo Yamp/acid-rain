@@ -33,6 +33,11 @@ impl Water {
         }
     }
 
+    /// Resize the grid, keeping existing wave centers alive.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.levels = Array2::zeros((width as usize, height as usize));
+    }
+
     #[inline(always)]
     pub fn height(&self) -> u16 {
         self.levels.shape()[1] as u16

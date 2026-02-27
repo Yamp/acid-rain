@@ -8,8 +8,9 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
+/// HSV → linear RGB (no u8 quantization).
 #[inline(always)]
-pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+fn hsv_to_linear(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
     let m = v - c;
@@ -22,8 +23,11 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         _ => (c, 0.0, x),
     };
 
-    let (r, g, b) = ((r1 + m) * 255.0, (g1 + m) * 255.0, (b1 + m) * 255.0);
-    (r as u8, g as u8, b as u8)
+    (
+        srgb_to_linear(r1 + m),
+        srgb_to_linear(g1 + m),
+        srgb_to_linear(b1 + m),
+    )
 }
 
 /// Water body color (intrinsic). Returns **linear** RGB.
@@ -39,12 +43,7 @@ pub fn water_body_color(value: f32) -> (f32, f32, f32) {
         (215.0 - t * 15.0, 0.4 + t * 0.5, 0.55 + t * 0.3)
     };
 
-    let (r, g, b) = hsv_to_rgb(hue, sat, val);
-    (
-        srgb_to_linear(r as f32 / 255.0),
-        srgb_to_linear(g as f32 / 255.0),
-        srgb_to_linear(b as f32 / 255.0),
-    )
+    hsv_to_linear(hue, sat, val)
 }
 
 /// Rainbow sky color based on full 3D reflected direction, cycling over time.
@@ -68,12 +67,7 @@ pub fn sky_color(elapsed: f32, dir: [f32; 3]) -> (f32, f32, f32) {
     let sat = 0.6 + elevation * 0.15 + 0.04 * (phase * 1.5).sin();
     let val = 0.88 + 0.07 * phase.cos();
 
-    let (r, g, b) = hsv_to_rgb(hue, sat.max(0.0), val.clamp(0.0, 1.0));
-    (
-        srgb_to_linear(r as f32 / 255.0),
-        srgb_to_linear(g as f32 / 255.0),
-        srgb_to_linear(b as f32 / 255.0),
-    )
+    hsv_to_linear(hue, sat.max(0.0), val.clamp(0.0, 1.0))
 }
 
 /// Schlick's Fresnel approximation for water (boosted R0 for visual effect).
