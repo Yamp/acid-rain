@@ -1,11 +1,8 @@
 /// sRGB → linear conversion for physically correct lighting
 #[inline(always)]
 fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    // Gamma‑2.0 approximation — avoids powf in the hot path
+    c * c
 }
 
 /// HSV → linear RGB (no u8 quantization).

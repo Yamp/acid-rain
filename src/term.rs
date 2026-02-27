@@ -58,7 +58,6 @@ const R0_B: f32 = 0.35;
 // Subsurface scattering
 const SSS_STRENGTH: f32 = 0.15;
 const SSS_DISTORTION: f32 = 0.3;
-const SSS_POWER: f32 = 3.0;
 
 // ── vector helpers ──────────────────────────────────────────────────
 
@@ -107,11 +106,8 @@ fn aces_tonemap(x: f32) -> f32 {
 
 #[inline(always)]
 fn linear_to_srgb(c: f32) -> f32 {
-    if c <= 0.0031308 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    }
+    // Gamma‑2.0 approximation — sqrt instead of powf(1/2.4)
+    c.sqrt()
 }
 
 // ── interleaved gradient noise (Jimenez 2014) ──────────────────────
@@ -576,7 +572,8 @@ fn shade_water(
         -light[1] + n[1] * SSS_DISTORTION,
         -light[2] + n[2] * SSS_DISTORTION,
     ]);
-    let sss_dot = dot3(view, sss_dir).max(0.0).powf(SSS_POWER);
+    let sss_dot_base = dot3(view, sss_dir).max(0.0);
+    let sss_dot = sss_dot_base * sss_dot_base * sss_dot_base; // x³ — avoids powf
     let sss_val = sss_dot * SSS_STRENGTH;
     let sss_term = [
         (1.0 - fr_v[0]) * wb.0 * sss_val,
