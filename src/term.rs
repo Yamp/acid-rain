@@ -59,6 +59,12 @@ const R0_B: f32 = 0.35;
 const SSS_STRENGTH: f32 = 0.15;
 const SSS_DISTORTION: f32 = 0.3;
 
+// Auto-exposure (eye adaptation)
+const AUTO_EXP_SPEED: f32 = 1.5;      // adaptation rate (1/seconds — higher = faster)
+const AUTO_EXP_TARGET: f32 = 0.25;    // target geometric-mean luminance
+const AUTO_EXP_MIN: f32 = 0.4;        // min exposure multiplier
+const AUTO_EXP_MAX: f32 = 2.5;        // max exposure multiplier
+
 // ── vector helpers ──────────────────────────────────────────────────
 
 #[inline(always)]
@@ -675,10 +681,11 @@ const PRESETS: &[ColorGrade] = &[
 
 /// Tonemap + color grade → sRGB [0,1] (ready for dither + quantize).
 #[inline(always)]
-fn apply_grade(hdr: [f32; 3], g: &ColorGrade) -> [f32; 3] {
-    let mut r = aces_tonemap(hdr[0] * g.exposure);
-    let mut gv = aces_tonemap(hdr[1] * g.exposure);
-    let mut b = aces_tonemap(hdr[2] * g.exposure);
+fn apply_grade(hdr: [f32; 3], g: &ColorGrade, auto_exp: f32) -> [f32; 3] {
+    let exp = g.exposure * auto_exp;
+    let mut r = aces_tonemap(hdr[0] * exp);
+    let mut gv = aces_tonemap(hdr[1] * exp);
+    let mut b = aces_tonemap(hdr[2] * exp);
 
     // contrast (pivot 0.5)
     r = 0.5 + (r - 0.5) * g.contrast;
@@ -711,6 +718,7 @@ pub struct Renderer {
     normal_grid: Vec<[f32; 4]>,   // precomputed Scharr normals [nx,ny,nz,slope_var]
     lap_grid: Vec<f32>,           // precomputed Laplacian (for caustics)
     sky_envmap: Vec<(f32, f32, f32)>, // octahedral sky envmap (SKY_ENV_SIZE²)
+    adapted_exposure: f32,            // auto-exposure: smoothed multiplier
     preset_idx: usize,
     frame: u32,
     width: u16,
@@ -733,6 +741,7 @@ impl Renderer {
             normal_grid: vec![[0.0; 4]; n],
             lap_grid: vec![0.0; n],
             sky_envmap: vec![(0.0, 0.0, 0.0); SKY_ENV_SIZE * SKY_ENV_SIZE],
+            adapted_exposure: 1.0,
             preset_idx: 0,
             frame: 0,
             width,
@@ -831,8 +840,8 @@ impl Renderer {
         precompute_laplacian(levels, &mut self.lap_grid);
         precompute_sky(elapsed, &mut self.sky_envmap);
 
-        // ── pass 1: shade into HDR buffer (1× + TAA jitter) ──
-        // Halton(2,3) sub-pixel jitter replaces 4× RGSS; TAA accumulates temporally
+        // ── pass 1: shade into HDR buffer (2× RGSS + TAA jitter) ──
+        const AA: [(f32, f32); 2] = [(-0.25, 0.25), (0.25, -0.25)];
         const TAA_JITTER: [(f32, f32); 8] = [
             ( 0.0,    -0.1667),
             (-0.25,    0.1667),
@@ -847,14 +856,21 @@ impl Renderer {
         let inv_w = 1.0 / w_f;
         let inv_vh = 1.0 / vh_f;
         for vy in 0..vh_us {
-            let vc = (vy as f32 + 0.5 + jitter.1) * inv_vh;
             let row_off = vy * w_us;
+            let vc_center = (vy as f32 + 0.5 + jitter.1) * inv_vh;
             for sx in 0..w_us {
-                let uc = (sx as f32 + 0.5 + jitter.0) * inv_w;
-                self.hdr_buf[row_off + sx] = shade_ray(
-                    &cam, levels,
+                let uc_center = (sx as f32 + 0.5 + jitter.0) * inv_w;
+                let c0 = shade_ray(&cam, levels,
                     &self.normal_grid, &self.lap_grid, &self.sky_envmap,
-                    gw, gh, light, uc, vc);
+                    gw, gh, light, uc_center + AA[0].0 * inv_w, vc_center + AA[0].1 * inv_vh);
+                let c1 = shade_ray(&cam, levels,
+                    &self.normal_grid, &self.lap_grid, &self.sky_envmap,
+                    gw, gh, light, uc_center + AA[1].0 * inv_w, vc_center + AA[1].1 * inv_vh);
+                self.hdr_buf[row_off + sx] = [
+                    (c0[0] + c1[0]) * 0.5,
+                    (c0[1] + c1[1]) * 0.5,
+                    (c0[2] + c1[2]) * 0.5,
+                ];
             }
         }
 
@@ -970,7 +986,26 @@ impl Renderer {
             self.hdr_buf[i][2] += b[2] * BLOOM_INTENSITY;
         }
 
+        // ── auto-exposure: measure log-average luminance, adapt smoothly ──
+        {
+            let step = 4;
+            let mut log_sum = 0.0_f32;
+            let mut count = 0u32;
+            for i in (0..total).step_by(step) {
+                let p = self.hdr_buf[i];
+                let lum = p[0] * 0.2126 + p[1] * 0.7152 + p[2] * 0.0722;
+                log_sum += (lum + 0.001).ln();
+                count += 1;
+            }
+            let avg_lum = (log_sum / count as f32).exp();
+            let target = (AUTO_EXP_TARGET / avg_lum).clamp(AUTO_EXP_MIN, AUTO_EXP_MAX);
+            let dt = 1.0 / 30.0;
+            self.adapted_exposure += (target - self.adapted_exposure)
+                * (1.0 - (-AUTO_EXP_SPEED * dt).exp());
+        }
+
         // ── pass 3: reprojected TAA + grade + dither + output ──
+        let auto_exp = self.adapted_exposure;
         let grade = &PRESETS[self.preset_idx];
         let frame_f = self.frame as f32;
         self.frame = self.frame.wrapping_add(1);
@@ -987,8 +1022,8 @@ impl Renderer {
                 let bot_hdr = self.reproject_blend(
                     cur_bot, &cam, sx as f32, (sy * 2 + 1) as f32, w_f, vh_f, w_us, vh_us);
 
-                let ts = apply_grade(top_hdr, grade);
-                let bs = apply_grade(bot_hdr, grade);
+                let ts = apply_grade(top_hdr, grade, auto_exp);
+                let bs = apply_grade(bot_hdr, grade, auto_exp);
                 let dt = ign(sx as f32, (sy * 2) as f32, frame_f);
                 let db = ign(sx as f32, (sy * 2 + 1) as f32, frame_f);
 
