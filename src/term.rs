@@ -23,29 +23,29 @@ const WATER_SCALE: f32 = 2.0;        // water plane size multiplier
 const DRIFT_SPEED: f32 = 0.15;       // world units per second
 const DRIFT_TURN_PERIOD: f32 = 180.0; // heading rotation period (lazy circle)
 
-const FOG_DENSITY: f32 = 0.08;
+const FOG_DENSITY: f32 = 0.12;
 
 const TAA_KEEP: f32 = 0.25;
 const TAA_NEW: f32 = 1.0 - TAA_KEEP;
 
-const CA_STRENGTH: f32 = 0.004; // chromatic aberration — max UV shift at corners
+const CA_STRENGTH: f32 = 0.006; // chromatic aberration — max UV shift at corners
 
-const GOD_RAY_SAMPLES: usize = 8;
+const GOD_RAY_SAMPLES: usize = 12;
 const GOD_RAY_DECAY: f32 = 0.96;
 const GOD_RAY_DENSITY: f32 = 0.5;
-const GOD_RAY_EXPOSURE: f32 = 0.12;
+const GOD_RAY_EXPOSURE: f32 = 0.18;
 
 const BLOOM_THRESHOLD: f32 = 1.0;
-const BLOOM_INTENSITY: f32 = 0.15;
-const BLOOM_RADIUS: i32 = 3;
-// Gaussian σ≈2, 7-tap separable kernel
-const BLOOM_KERNEL: [f32; 7] = [0.0702, 0.1311, 0.1907, 0.2161, 0.1907, 0.1311, 0.0702];
+const BLOOM_INTENSITY: f32 = 0.25;
+const BLOOM_RADIUS: i32 = 5;
+// Gaussian σ≈3, 11-tap separable kernel
+const BLOOM_KERNEL: [f32; 11] = [0.0355, 0.0571, 0.0839, 0.1127, 0.1384, 0.1551, 0.1384, 0.1127, 0.0839, 0.0571, 0.0355];
 
 const NORMAL_STRENGTH: f32 = 7.0;
 const NDF_FILTER_K: f32 = 0.5;
 
 const CAUSTIC_STRENGTH: f32 = 12.0;
-const CAUSTIC_DISPERSION: f32 = 0.012; // R/B chromatic offset in UV
+const CAUSTIC_DISPERSION: f32 = 0.018; // R/B chromatic offset in UV
 const AMBIENT: f32 = 0.55;
 const DIFFUSE_K: f32 = 0.4;
 const GGX_ROUGHNESS: f32 = 0.08;
@@ -70,7 +70,7 @@ const REFR_CAUSTIC_K: f32 = 6.0;      // refraction lensing from surface curvatu
 const HG_G: f32 = 0.75;               // Henyey-Greenstein forward scatter asymmetry
 
 // Toxic emission (bioluminescence / radioactive glow)
-const EMIT_STRENGTH: f32 = 0.08;      // base emission intensity
+const EMIT_STRENGTH: f32 = 0.14;      // base emission intensity
 const EMIT_COLOR: [f32; 3] = [0.15, 1.0, 0.6]; // acid green-cyan
 
 // ── flat f32 casts for SIMD-friendly bulk passes ────────────────────
@@ -158,7 +158,7 @@ fn ign(x: f32, y: f32, frame: f32) -> f32 {
 
 // ── sky envmap (octahedral, precomputed per frame) ──────────────────
 
-const SKY_ENV_SIZE: usize = 64;
+const SKY_ENV_SIZE: usize = 128;
 
 /// Octahedral mapping: direction → UV [0,1]² (no transcendentals).
 #[inline(always)]
@@ -767,7 +767,7 @@ struct ColorGrade {
 }
 
 const PRESETS: &[ColorGrade] = &[
-    ColorGrade { name: "default",   exposure: 1.05, contrast: 1.1,  saturation: 1.35, gain: [1.0, 1.0, 1.0],   hue_speed: 0.0, breathe: 0.0 },
+    ColorGrade { name: "default",   exposure: 1.05, contrast: 1.2,  saturation: 1.5,  gain: [1.0, 1.0, 1.0],   hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "storm",     exposure: 0.85, contrast: 1.25, saturation: 0.55, gain: [0.82, 0.9, 1.08], hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "neon",      exposure: 1.05, contrast: 1.3,  saturation: 1.5,  gain: [1.05, 0.85, 1.15],hue_speed: 0.0, breathe: 0.0 },
     ColorGrade { name: "moonlight", exposure: 0.55, contrast: 0.85, saturation: 0.25, gain: [0.7, 0.82, 1.3],  hue_speed: 0.0, breathe: 0.0 },
