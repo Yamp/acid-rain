@@ -59,6 +59,16 @@ const R0_B: f32 = 0.35;
 const SSS_STRENGTH: f32 = 0.15;
 const SSS_DISTORTION: f32 = 0.3;
 
+// Water transparency — physically-based volume transport
+const WATER_DEPTH: f32 = 0.70;        // base optical thickness of water layer
+const DEPTH_WAVE_K: f32 = 0.5;        // wave height contribution to depth
+const IOR_WATER: f32 = 1.33;          // refractive index
+const REFR_DISPERSION: f32 = 0.018;   // per-channel IOR offset (chromatic)
+// Beer-Lambert absorption coefficients (1/depth): acid-green transparency window
+const ABSORB: [f32; 3] = [4.0, 0.8, 2.0]; // red >> blue > green
+const REFR_CAUSTIC_K: f32 = 6.0;      // refraction lensing from surface curvature
+const HG_G: f32 = 0.75;               // Henyey-Greenstein forward scatter asymmetry
+
 // Toxic emission (bioluminescence / radioactive glow)
 const EMIT_STRENGTH: f32 = 0.08;      // base emission intensity
 const EMIT_COLOR: [f32; 3] = [0.15, 1.0, 0.6]; // acid green-cyan
@@ -464,10 +474,12 @@ fn caustic_from_grid(
 /// Rendering equation decomposition:
 ///   L_o = env × F(θ_v)                                — environment reflection
 ///       + D·G·F(θ_h) / (4·n·v)                        — Cook-Torrance direct specular
-///       + (1-F(θ_l))·(1-F(θ_v))·c·n·l·DIFFUSE_K      — direct diffuse
-///       + (1-F(θ_l))·(1-F(θ_v))·c·caustic·n·l        — caustics
-///       + (1-F(θ_v))·c·AMBIENT                        — indirect diffuse
-///       + (1-F(θ_v))·c·sss                            — subsurface scattering
+///       + (1-F_v) × L_refr × beer(d/cosθ_t) × lens    — refracted sky (BTDF)
+///       + (1-F_l)·(1-F_v)·c·n·l·K_d × (1-beer)       — volume diffuse scatter
+///       + (1-F_l)·(1-F_v)·c·caustic·n·l × (1-beer)   — volume caustics
+///       + (1-F_v)·c·AMBIENT × (1-beer)                — ambient scatter
+///       + (1-F_v)·c·sss·HG(cosθ) × (1-beer)          — Henyey-Greenstein SSS
+///       + emission                                     — bioluminescence
 fn shade_water(
     levels: &Array2<f32>,
     normal_grid: &[[f32; 4]],
@@ -569,51 +581,105 @@ fn shade_water(
     // Fresnel at light angle (diffuse energy conservation)
     let fr_l = fresnel_rgb(n_dot_l);
 
-    // ── Transmitted component ──
+    // ── Refracted transmission through water (physically-based BTDF) ──
+
+    // Base refracted angle for Beer-Lambert path length
+    let base_eta = 1.0 / IOR_WATER;
+    let sin2_t_base = base_eta * base_eta * (1.0 - n_dot_v * n_dot_v);
+    let cos_t = if sin2_t_base < 1.0 { (1.0 - sin2_t_base).sqrt() } else { 0.001 };
+
+    // Wave-dependent optical depth: crests thinner, troughs deeper
+    let depth = (WATER_DEPTH + level * DEPTH_WAVE_K).clamp(0.02, 1.5);
+    let path_len = depth / cos_t;
+
+    // Beer-Lambert per-channel absorption (acid-green transparency window)
+    let beer = [
+        (-ABSORB[0] * path_len).exp(),
+        (-ABSORB[1] * path_len).exp(),
+        (-ABSORB[2] * path_len).exp(),
+    ];
+
+    // Chromatic refracted sky (Snell's law with per-channel IOR dispersion)
+    let refr_sky = {
+        let refr_channel = |eta: f32| -> (f32, f32, f32) {
+            let sin2_t = eta * eta * (1.0 - n_dot_v * n_dot_v);
+            if sin2_t < 1.0 {
+                let cos_t_ch = (1.0 - sin2_t).sqrt();
+                let r = [
+                    eta * dir[0] + (eta * n_dot_v - cos_t_ch) * n[0],
+                    eta * dir[1] + (eta * n_dot_v - cos_t_ch) * n[1],
+                    eta * dir[2] + (eta * n_dot_v - cos_t_ch) * n[2],
+                ];
+                // Flip z: see sky above through water surface
+                sample_sky(sky_env, norm3([r[0], r[1], -r[2]]))
+            } else {
+                sample_sky(sky_env, refl_dir)
+            }
+        };
+        let sr = refr_channel(base_eta - REFR_DISPERSION);
+        let sg = refr_channel(base_eta);
+        let sb = refr_channel(base_eta + REFR_DISPERSION);
+        (sr.0, sg.1, sb.2)
+    };
+
+    // Refraction lensing: surface curvature focuses transmitted light (pool caustics)
+    let lap_val = sample_grid1(lap_grid, gw, gh, wp[0], wp[1]);
+    let lens = (1.0 + (-lap_val * REFR_CAUSTIC_K * depth).max(0.0)).min(3.0);
+
+    // Refracted sky term: T_surface × L_sky × Beer × lens
+    let refr_term = [
+        (1.0 - fr_v[0]) * refr_sky.0 * beer[0] * lens,
+        (1.0 - fr_v[1]) * refr_sky.1 * beer[1] * lens,
+        (1.0 - fr_v[2]) * refr_sky.2 * beer[2] * lens,
+    ];
+
+    // ── Volume scattering (energy not transmitted → scattered in medium) ──
+    let scatter = [1.0 - beer[0], 1.0 - beer[1], 1.0 - beer[2]];
     let wb = water_body_color(level);
     let caustic = caustic_from_grid(lap_grid, gw, gh, wp[0], wp[1], n);
 
-    // Direct diffuse: (1-F_l)(1-F_v) — light enters, scatters, exits
+    // Direct diffuse: only the scattered fraction contributes
     let direct_diff = [
-        (1.0 - fr_l[0]) * (1.0 - fr_v[0]) * wb.0 * n_dot_l * DIFFUSE_K,
-        (1.0 - fr_l[1]) * (1.0 - fr_v[1]) * wb.1 * n_dot_l * DIFFUSE_K,
-        (1.0 - fr_l[2]) * (1.0 - fr_v[2]) * wb.2 * n_dot_l * DIFFUSE_K,
+        (1.0 - fr_l[0]) * (1.0 - fr_v[0]) * wb.0 * n_dot_l * DIFFUSE_K * scatter[0],
+        (1.0 - fr_l[1]) * (1.0 - fr_v[1]) * wb.1 * n_dot_l * DIFFUSE_K * scatter[1],
+        (1.0 - fr_l[2]) * (1.0 - fr_v[2]) * wb.2 * n_dot_l * DIFFUSE_K * scatter[2],
     ];
 
     // Caustics: refracted sunlight focused by surface curvature
     let caustic_term = [
-        (1.0 - fr_l[0]) * (1.0 - fr_v[0]) * wb.0 * caustic[0] * n_dot_l,
-        (1.0 - fr_l[1]) * (1.0 - fr_v[1]) * wb.1 * caustic[1] * n_dot_l,
-        (1.0 - fr_l[2]) * (1.0 - fr_v[2]) * wb.2 * caustic[2] * n_dot_l,
+        (1.0 - fr_l[0]) * (1.0 - fr_v[0]) * wb.0 * caustic[0] * n_dot_l * scatter[0],
+        (1.0 - fr_l[1]) * (1.0 - fr_v[1]) * wb.1 * caustic[1] * n_dot_l * scatter[1],
+        (1.0 - fr_l[2]) * (1.0 - fr_v[2]) * wb.2 * caustic[2] * n_dot_l * scatter[2],
     ];
 
-    // Ambient (indirect hemisphere irradiance)
+    // Ambient (indirect hemisphere irradiance, scattered fraction only)
     let ambient_tx = [
-        (1.0 - fr_v[0]) * wb.0 * AMBIENT,
-        (1.0 - fr_v[1]) * wb.1 * AMBIENT,
-        (1.0 - fr_v[2]) * wb.2 * AMBIENT,
+        (1.0 - fr_v[0]) * wb.0 * AMBIENT * scatter[0],
+        (1.0 - fr_v[1]) * wb.1 * AMBIENT * scatter[1],
+        (1.0 - fr_v[2]) * wb.2 * AMBIENT * scatter[2],
     ];
 
-    // SSS: forward-scattered transmitted light
+    // SSS with Henyey-Greenstein phase function: p(cosθ) = (1-g)³ / (1+g²-2g·cosθ)^1.5
+    // Normalized so p(1)=1 — forward scatter peak matches SSS_STRENGTH directly
     let sss_dir = norm3([
         -light[0] + n[0] * SSS_DISTORTION,
         -light[1] + n[1] * SSS_DISTORTION,
         -light[2] + n[2] * SSS_DISTORTION,
     ]);
-    let sss_dot = dot3(view, sss_dir).max(0.0);
-    let sss_dot = sss_dot * sss_dot * sss_dot; // cube (SSS_POWER = 3.0)
-    let sss_val = sss_dot * SSS_STRENGTH;
+    let cos_sss = dot3(view, sss_dir).max(0.0);
+    let onemg = 1.0 - HG_G;
+    let hg_denom = 1.0 + HG_G * HG_G - 2.0 * HG_G * cos_sss;
+    let hg_phase = onemg * onemg * onemg / (hg_denom * hg_denom.sqrt());
+    let sss_val = hg_phase * SSS_STRENGTH;
     let sss_term = [
-        (1.0 - fr_v[0]) * wb.0 * sss_val,
-        (1.0 - fr_v[1]) * wb.1 * sss_val,
-        (1.0 - fr_v[2]) * wb.2 * sss_val,
+        (1.0 - fr_v[0]) * wb.0 * sss_val * scatter[0],
+        (1.0 - fr_v[1]) * wb.1 * sss_val * scatter[1],
+        (1.0 - fr_v[2]) * wb.2 * sss_val * scatter[2],
     ];
 
     // ── Toxic emission: bioluminescent glow from within the water ──
-    // Stronger on wave crests (positive level) and steep slopes (high slope_var).
-    // Transmitted through surface: attenuated by (1 - F_v).
-    let emit_wave = level.max(0.0) * 4.0;           // crests glow brighter
-    let emit_slope = (slope_var * 2.0).min(1.0);     // agitated water glows more
+    let emit_wave = level.max(0.0) * 4.0;
+    let emit_slope = (slope_var * 2.0).min(1.0);
     let emit_i = EMIT_STRENGTH * (0.3 + 0.5 * emit_wave + 0.2 * emit_slope);
     let emit = [
         (1.0 - fr_v[0]) * EMIT_COLOR[0] * emit_i,
@@ -622,11 +688,11 @@ fn shade_water(
     ];
 
     // ── Combine ──
-    // env × F_v + specular (F_h inside) + diffuse + caustics + ambient + SSS + emission
+    // reflection + specular + refracted sky + volume(diffuse+caustic+ambient+SSS) + emission
     [
-        env.0 * fr_v[0] + direct_spec[0] + direct_diff[0] + caustic_term[0] + ambient_tx[0] + sss_term[0] + emit[0],
-        env.1 * fr_v[1] + direct_spec[1] + direct_diff[1] + caustic_term[1] + ambient_tx[1] + sss_term[1] + emit[1],
-        env.2 * fr_v[2] + direct_spec[2] + direct_diff[2] + caustic_term[2] + ambient_tx[2] + sss_term[2] + emit[2],
+        env.0 * fr_v[0] + direct_spec[0] + refr_term[0] + direct_diff[0] + caustic_term[0] + ambient_tx[0] + sss_term[0] + emit[0],
+        env.1 * fr_v[1] + direct_spec[1] + refr_term[1] + direct_diff[1] + caustic_term[1] + ambient_tx[1] + sss_term[1] + emit[1],
+        env.2 * fr_v[2] + direct_spec[2] + refr_term[2] + direct_diff[2] + caustic_term[2] + ambient_tx[2] + sss_term[2] + emit[2],
     ]
 }
 

@@ -61,7 +61,7 @@ pub fn water_body_color(value: f32) -> (f32, f32, f32) {
 #[inline(always)]
 pub fn sky_color(elapsed: f32, dir: [f32; 3]) -> (f32, f32, f32) {
     use std::f32::consts::PI;
-    let period = 37.5; // 150/4 = 37.5s full cycle
+    let period = 122.0; // full hue rotation every 2m02s
     let phase = elapsed / period * 2.0 * PI;
     let elevation = dir[2].max(0.0);
 

@@ -123,7 +123,7 @@ impl Water {
         self.wave_centers.push(WaveCenter::new(
             x as f32 / width as f32,
             y as f32 / height as f32,
-            rand::random::<f32>() * 0.15,
+            rand::random::<f32>() * 0.30,
             self.time,
         ));
     }
