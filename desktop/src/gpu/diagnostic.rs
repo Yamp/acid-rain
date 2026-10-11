@@ -30,6 +30,7 @@ pub fn checkpoint(
     });
     queue.submit([std::mem::replace(encoder, next).finish()]);
     let polled = device.poll(wgpu::PollType::wait_indefinitely());
+    super::errors::dump_driver_messages(device);
     super::errors::check(device, errors)
         .with_context(|| format!("GPU checkpoint failed: {label}"))?;
     polled.with_context(|| format!("GPU checkpoint wait failed: {label}"))?;

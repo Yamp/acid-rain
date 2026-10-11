@@ -162,70 +162,10 @@ pub fn fallback_completion(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    fn dump_driver_messages(device: &wgpu::Device) {
-        #[cfg(not(target_os = "windows"))]
-        let _ = device;
-        #[cfg(target_os = "windows")]
-        {
-            use windows::{
-                Win32::Graphics::Direct3D12::{
-                    D3D12_MESSAGE,
-                    ID3D12InfoQueue,
-                },
-                core::Interface,
-            };
-            // SAFETY: the HAL guard keeps the native device alive. We only read
-            // its debug queue, never submit or mutate graphics resources.
-            let Some(raw) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
-                return;
-            };
-            let Ok(messages) = raw.raw_device().cast::<ID3D12InfoQueue>() else {
-                eprintln!("DX12 validation message queue unavailable (debug layer missing)");
-                return;
-            };
-            // SAFETY: each buffer is allocated with D3D12_MESSAGE alignment and
-            // the native reported byte length before GetMessage writes into it.
-            unsafe {
-                let count = messages.GetNumStoredMessagesAllowedByRetrievalFilter();
-                eprintln!("DX12 validation messages: {count}");
-                for index in 0..count.min(256) {
-                    let mut length = 0;
-                    if messages.GetMessage(index, None, &mut length).is_err()
-                        || length < std::mem::size_of::<D3D12_MESSAGE>()
-                    {
-                        continue;
-                    }
-                    let mut storage = vec![
-                        D3D12_MESSAGE::default();
-                        length.div_ceil(std::mem::size_of::<D3D12_MESSAGE>())
-                    ];
-                    if messages
-                        .GetMessage(index, Some(storage.as_mut_ptr()), &mut length)
-                        .is_ok()
-                    {
-                        let message = &storage[0];
-                        let description = if message.pDescription.is_null() {
-                            std::borrow::Cow::Borrowed("<no description>")
-                        } else {
-                            String::from_utf8_lossy(std::slice::from_raw_parts(
-                                message.pDescription,
-                                message.DescriptionByteLength,
-                            ))
-                        };
-                        eprintln!(
-                            "DX12 validation severity={} id={}: {}",
-                            message.Severity.0,
-                            message.ID.0,
-                            description.trim_end_matches('\0')
-                        );
-                    }
-                }
-                messages.ClearStoredMessages();
-            }
-        }
-    }
+    use super::{
+        super::errors::dump_driver_messages,
+        *,
+    };
 
     /// Deliberately tiny work isolates native query recording/resolution from
     /// the water shaders. It uses the same two pass-boundary writes as a frame.
@@ -383,9 +323,10 @@ mod tests {
         }
         if serialized {
             queue.submit([encoder.finish()]);
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let polled = device.poll(wgpu::PollType::wait_indefinitely());
             dump_driver_messages(&device);
             super::super::errors::check(&device, &errors).unwrap();
+            polled.unwrap();
             encoder = device.create_command_encoder(&Default::default());
         }
         {
@@ -402,9 +343,10 @@ mod tests {
         }
         if serialized {
             queue.submit([encoder.finish()]);
-            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let polled = device.poll(wgpu::PollType::wait_indefinitely());
             dump_driver_messages(&device);
             super::super::errors::check(&device, &errors).unwrap();
+            polled.unwrap();
             encoder = device.create_command_encoder(&Default::default());
         }
         slot.resolve(&mut encoder);

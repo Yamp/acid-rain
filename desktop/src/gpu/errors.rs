@@ -48,6 +48,85 @@ pub fn init_diagnostics_logging() {
     }
 }
 
+pub fn dump_driver_messages(device: &wgpu::Device) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = device;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::{
+            Win32::Graphics::Direct3D12::{
+                D3D12_MESSAGE,
+                ID3D12InfoQueue,
+            },
+            core::Interface,
+        };
+        // SAFETY: the HAL guard keeps the native device alive. We only read
+        // its debug queue, never submit or mutate graphics resources.
+        let Some(raw) = (unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }) else {
+            return;
+        };
+        let Ok(messages) = raw.raw_device().cast::<ID3D12InfoQueue>() else {
+            eprintln!("DX12 validation message queue unavailable (debug layer missing)");
+            return;
+        };
+        // SAFETY: each buffer is allocated with D3D12_MESSAGE alignment and
+        // the native reported byte length before GetMessage writes into it.
+        unsafe {
+            let count = messages.GetNumStoredMessagesAllowedByRetrievalFilter();
+            eprintln!("DX12 validation messages: {count}");
+            for index in 0..count.min(256) {
+                let mut length = 0;
+                if messages.GetMessage(index, None, &mut length).is_err()
+                    || length < std::mem::size_of::<D3D12_MESSAGE>()
+                {
+                    continue;
+                }
+                let mut storage = vec![
+                    D3D12_MESSAGE::default();
+                    length.div_ceil(std::mem::size_of::<D3D12_MESSAGE>())
+                ];
+                if messages
+                    .GetMessage(index, Some(storage.as_mut_ptr()), &mut length)
+                    .is_ok()
+                {
+                    let message = &storage[0];
+                    let description = if message.pDescription.is_null() {
+                        std::borrow::Cow::Borrowed("<no description>")
+                    } else {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(
+                            message.pDescription,
+                            message.DescriptionByteLength,
+                        ))
+                    };
+                    eprintln!(
+                        "DX12 validation severity={} id={}: {}",
+                        message.Severity.0,
+                        message.ID.0,
+                        description.trim_end_matches('\0')
+                    );
+                }
+            }
+            messages.ClearStoredMessages();
+        }
+    }
+}
+
+
+/// Explicit debug runs retain native diagnostics even if an upstream API panics.
+pub struct DriverMessagesOnDrop {
+    device: wgpu::Device,
+}
+impl DriverMessagesOnDrop {
+    pub fn new(device: &wgpu::Device) -> Self {
+        Self {
+            device: device.clone(),
+        }
+    }
+}
+impl Drop for DriverMessagesOnDrop {
+    fn drop(&mut self) { dump_driver_messages(&self.device); }
+}
+
 pub fn check(
     device: &wgpu::Device,
     diagnostics: &std::sync::Mutex<Diagnostics>,
@@ -56,6 +135,7 @@ pub fn check(
     // outside a callback also avoids reentering wgpu's device-lost machinery.
     let message = diagnostics.lock().unwrap().fatal().map(str::to_owned);
     if let Some(message) = message {
+        dump_driver_messages(device);
         #[cfg(target_os = "windows")]
         {
             // SAFETY: only reads an HRESULT through the live guarded device;

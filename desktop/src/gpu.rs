@@ -201,6 +201,7 @@ pub struct GpuRenderer {
     pub hardware_filtering: bool,
     pub timestamp_queries: bool,
     pub common_sampler_layout: wgpu::BindGroupLayout,
+    driver_debug: bool,
     pub common_samplers: wgpu::BindGroup,
     timers: Option<[TimingSlot; 3]>,
     slot_busy: [Arc<AtomicBool>; 3],
@@ -249,8 +250,12 @@ impl GpuRenderer {
             !backends.is_empty(),
             "Choose a DX12, Vulkan or Metal backend"
         );
+        let instance_flags = wgpu::InstanceFlags::from_env_or_default();
+        let driver_debug =
+            instance_flags.intersects(wgpu::InstanceFlags::DEBUG | wgpu::InstanceFlags::VALIDATION);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
+            flags: instance_flags,
             ..Default::default()
         });
         let surface = window
@@ -472,6 +477,7 @@ impl GpuRenderer {
             adapter_info,
             hardware_filtering,
             timestamp_queries,
+            driver_debug,
             timers,
             slot_busy: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
             timing_state: Arc::new(Mutex::new(TimingState::default())),
@@ -554,6 +560,8 @@ impl GpuRenderer {
 
     pub fn pass_diagnostics_enabled(&self) -> bool { self.diagnose_passes }
 
+    pub fn driver_debug_enabled(&self) -> bool { self.driver_debug }
+
     pub fn resize(
         &mut self,
         width: u32,
@@ -611,6 +619,9 @@ impl GpuRenderer {
     }
 
     pub fn capture_rgba(&self) -> Result<Vec<u8>> {
+        let _driver_messages = self
+            .driver_debug
+            .then(|| errors::DriverMessagesOnDrop::new(&self.device));
         let texture = self
             .offline
             .as_ref()
@@ -622,6 +633,9 @@ impl GpuRenderer {
 
     /// Explicit synchronization for captures/tests only; interactive rendering never waits.
     pub fn wait_idle(&self) -> Result<()> {
+        let _driver_messages = self
+            .driver_debug
+            .then(|| errors::DriverMessagesOnDrop::new(&self.device));
         let result = self.device.poll(wgpu::PollType::wait_indefinitely());
         self.check_error()?;
         result?;
@@ -668,6 +682,9 @@ impl GpuRenderer {
         ),
     {
         let started = Instant::now();
+        let _driver_messages = self
+            .driver_debug
+            .then(|| errors::DriverMessagesOnDrop::new(&self.device));
         let polled = self.device.poll(wgpu::PollType::Poll);
         self.check_error()?;
         polled?;

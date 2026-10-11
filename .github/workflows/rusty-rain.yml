@@ -236,7 +236,7 @@ jobs:
     name: Windows GPU profiling probe
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows-probe }}
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       RUSTFLAGS: -C target-feature=+crt-static
     defaults:
@@ -275,7 +275,7 @@ jobs:
             ref = $env:GITHUB_REF
             release_eligible = $false
           } | ConvertTo-Json | Set-Content artifacts/probe-source.json
-          Set-Content artifacts/NOT-A-RELEASE.txt 'Windows-only diagnostic. This run does not validate all platforms and cannot supply release archives. Software-driver timings are not hardware GPU performance measurements.'
+          Set-Content artifacts/NOT-A-RELEASE.txt 'Windows-only diagnostic. This run does not validate all platforms and cannot supply release archives. Debug validation and serialized passes are diagnostic overhead; software-driver timings are not hardware GPU performance measurements.'
       - name: Check locked desktop before compilation
         run: cargo check --locked -p acid-rain-desktop --all-targets --target x86_64-pc-windows-msvc
       - name: Build portable desktop
@@ -284,6 +284,8 @@ jobs:
         shell: pwsh
         env:
           WGPU_BACKEND: dx12
+          WGPU_DEBUG: "0"
+          WGPU_VALIDATION: "1"
           ACID_RAIN_GPU_TESTS: "1"
           ACID_RAIN_SOFTWARE: "1"
         run: |
@@ -327,7 +329,16 @@ jobs:
           $common = @('--headless', '--backend', 'dx12', '--software', '--quality', 'high', '--frames', '12', '--warmup', '2', '--size', '320x200')
           $results.normal_capture = Invoke-Probe -Name 'normal-capture' -Program $binary -Arguments ($common + @('--output', 'artifacts/normal-capture.png', '--report', 'artifacts/normal-capture.json'))
           $results.no_timestamps_capture = Invoke-Probe -Name 'no-timestamps-capture' -Program $binary -Arguments ($common + @('--no-gpu-timestamps', '--output', 'artifacts/no-timestamps-capture.png', '--report', 'artifacts/no-timestamps-capture.json'))
-          foreach ($capture in @(@('normal_capture', 'normal-capture'), @('no_timestamps_capture', 'no-timestamps-capture'))) {
+          $results.serialized_capture = Invoke-Probe -Name 'serialized-capture' -Program $binary -Arguments ($common + @('--diagnose-gpu-passes', '--output', 'artifacts/serialized-capture.png', '--report', 'artifacts/serialized-capture.json'))
+          $results.serialized_no_timestamps_capture = Invoke-Probe -Name 'serialized-no-timestamps-capture' -Program $binary -Arguments ($common + @('--diagnose-gpu-passes', '--no-gpu-timestamps', '--output', 'artifacts/serialized-no-timestamps-capture.png', '--report', 'artifacts/serialized-no-timestamps-capture.json'))
+          # DEBUG disables FXC optimization; isolate that variable from native validation.
+          $env:WGPU_DEBUG = '1'
+          try {
+            $results.unoptimized_capture = Invoke-Probe -Name 'unoptimized-capture' -Program $binary -Arguments ($common + @('--output', 'artifacts/unoptimized-capture.png', '--report', 'artifacts/unoptimized-capture.json'))
+          } finally {
+            $env:WGPU_DEBUG = '0'
+          }
+          foreach ($capture in @(@('normal_capture', 'normal-capture'), @('no_timestamps_capture', 'no-timestamps-capture'), @('serialized_capture', 'serialized-capture'), @('serialized_no_timestamps_capture', 'serialized-no-timestamps-capture'), @('unoptimized_capture', 'unoptimized-capture'))) {
             if ($results[$capture[0]] -eq 0 -and (!(Test-Path "artifacts/$($capture[1]).png" -PathType Leaf) -or !(Test-Path "artifacts/$($capture[1]).json" -PathType Leaf))) {
               $results[$capture[0]] = 1
               Set-Content "artifacts/$($capture[1]).missing-output.txt" 'Successful process exit did not produce both capture files.'

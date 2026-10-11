@@ -244,9 +244,12 @@ fn headless(o: &Options) -> anyhow::Result<()> {
         "capture_readback_ms": readback_ms,
         "total_completed_ms_including_warmup_and_readback": completed_ms,
         "diagnostic_serialization": gpu.pass_diagnostics_enabled(),
-        "performance_timing_valid": !gpu.pass_diagnostics_enabled(),
+        "driver_debugging": gpu.driver_debug_enabled(),
+        "performance_timing_valid": !gpu.pass_diagnostics_enabled() && !gpu.driver_debug_enabled(),
         "timing_note": if gpu.pass_diagnostics_enabled() {
             "DIAGNOSTIC ONLY: each production GPU pass is submitted and waited separately. All timings include forced serialization and must not be used as performance measurements."
+        } else if gpu.driver_debug_enabled() {
+            "DIAGNOSTIC ONLY: native GPU debugging or validation is enabled. Timings include diagnostic overhead and must not be used as performance measurements."
         } else {
             "Steady wall time includes simulation, snapshot, render calls and final GPU drain; warm-up is fully drained first. Render-call durations include queue backpressure and exclude simulation. GPU intervals bracket the dependent scene passes through final post-processing and exclude the UI overlay, using actual timestamp queries when available. Completion latency includes queued work and callback service. Capture readback is excluded from steady timing."
         },
