@@ -36,5 +36,9 @@ panic = "unwind"
 
 [workspace]
 members = [".", "desktop", "native/core"]
+exclude = ["vendor/wgpu-core"]
 default-members = ["."]
 resolver = "3"
+
+[patch.crates-io]
+wgpu-core = { path = "vendor/wgpu-core" }

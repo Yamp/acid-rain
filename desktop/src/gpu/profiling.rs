@@ -174,12 +174,12 @@ mod tests {
             return;
         }
         super::super::errors::init_diagnostics_logging();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::from_env()
-                .unwrap_or(wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12),
-            flags: wgpu::InstanceFlags::debugging().with_env(),
-            ..Default::default()
-        });
+        let configured = super::super::create_instance(
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            wgpu::InstanceFlags::debugging().with_env(),
+        )
+        .expect("Timestamp fixture compiler initialization failed");
+        let instance = &configured.instance;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
             ..Default::default()
@@ -190,8 +190,9 @@ mod tests {
             return;
         }
         eprintln!(
-            "Timestamp fixture adapter: {:?}; serialized={serialized}",
-            adapter.get_info()
+            "Timestamp fixture adapter: {:?}; shader compiler: {}; serialized={serialized}",
+            adapter.get_info(),
+            configured.shader_compiler(adapter.get_info().backend)
         );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::TIMESTAMP_QUERY,
@@ -419,10 +420,12 @@ mod tests {
         if std::env::var("ACID_RAIN_GPU_TESTS").as_deref() != Ok("1") {
             return;
         }
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
-            ..Default::default()
-        });
+        let configured = super::super::create_instance(
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            wgpu::InstanceFlags::from_env_or_default(),
+        )
+        .expect("Timing cancellation fixture compiler initialization failed");
+        let instance = &configured.instance;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
             ..Default::default()

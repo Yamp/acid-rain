@@ -52,7 +52,12 @@ mod tests {
         if std::env::var("ACID_RAIN_GPU_TESTS").as_deref() != Ok("1") {
             return;
         }
-        let instance = wgpu::Instance::default();
+        let configured = super::super::create_instance(
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            wgpu::InstanceFlags::from_env_or_default(),
+        )
+        .expect("Checkpoint fixture compiler initialization failed");
+        let instance = &configured.instance;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
             ..Default::default()

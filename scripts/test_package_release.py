@@ -1,5 +1,6 @@
 """Release archives must be usable, complete and verifiable after download."""
 import hashlib
+import json
 import plistlib
 from pathlib import Path
 import shutil
@@ -24,8 +25,23 @@ class ReleasePackageTests(unittest.TestCase):
         self.bin.mkdir()
         for file in ["README.md", "LICENSE", "desktop/README.md"]:
             (self.repo / file).write_text("Documentation " + file)
+        for file in ["vendor/wgpu-core/LICENSE.MIT", "vendor/wgpu-core/LICENSE.APACHE",
+                     "vendor/README.md", "vendor/wgpu-core-backport.patch",
+                     "vendor/wgpu-core-provenance.json"]:
+            destination = self.repo / file
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SCRIPT.parent.parent / file, destination)
         for file in ["acid-rain", "acid-rain-desktop", "acid-rain.exe", "acid-rain-desktop.exe"]:
             (self.bin / file).write_bytes(b"portable program " + file.encode())
+        dxc_files = ["dxcompiler.dll", "licenses/dxc/LICENCE-MIT.txt",
+                     "licenses/dxc/LICENSE-LLVM.txt", "licenses/dxc/LICENSE-MS.txt"]
+        for file in dxc_files:
+            destination = self.bin / file
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"DXC packaging test fixture: " + file.encode())
+        (self.bin / "dxc-provenance.json").write_text(json.dumps({
+            "architecture": "x64", "files": {file: hashlib.sha256((self.bin / file).read_bytes()).hexdigest()
+                                                for file in dxc_files}}))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -65,6 +81,31 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn(name, contents)
         self.assertIn(b'%~dp0', contents["Start Desktop.cmd"])
 
+    def test_windows_dxc_is_required_and_its_provenance_hashes_are_verified(self):
+        compiler = self.bin / "dxcompiler.dll"
+        original = compiler.read_bytes()
+        compiler.unlink()
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dxcompiler.dll", result.stderr)
+        compiler.write_bytes(original + b"corruption")
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checksum", result.stderr)
+        self.assertFalse(list(self.out.glob("*.zip")))
+        compiler.write_bytes(original)
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(next(self.out.glob("*.zip"))) as archive:
+            prefix = "acid-rain-0.2.0-windows-x86_64/"
+            manifest = dict(reversed(line.split("  ", 1)) for line in
+                            archive.read(prefix + "SHA256SUMS").decode().splitlines())
+            for name in ["dxcompiler.dll", "licenses/dxc/LICENCE-MIT.txt", "licenses/dxc/LICENSE-LLVM.txt",
+                         "licenses/dxc/LICENSE-MS.txt", "dxc-provenance.json"]:
+                content = archive.read(prefix + name)
+                self.assertEqual(content, (self.bin / name).read_bytes())
+                self.assertEqual(hashlib.sha256(content).hexdigest(), manifest[name])
+
     def test_packaged_readme_resolves_source_links_at_release_tag(self):
         (self.repo / "docs/images").mkdir(parents=True)
         (self.repo / "native").mkdir()
@@ -100,6 +141,35 @@ class ReleasePackageTests(unittest.TestCase):
         archive = next(self.out.glob("*.tar.gz"))
         archive.write_bytes(archive.read_bytes() + b"corrupted download")
         self.assertNotEqual(self.run_script("manifest", "--directory", str(self.out)).returncode, 0)
+
+    def test_vendor_notices_are_required_preserved_and_checksummed(self):
+        license = self.repo / "vendor/wgpu-core/LICENSE.MIT"
+        license_bytes = license.read_bytes()
+        license.unlink()
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LICENSE.MIT", result.stderr)
+        self.assertFalse(list(self.out.glob("*.zip")))
+        license.write_bytes(license_bytes)
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(next(self.out.glob("*.zip"))) as archive:
+            prefix = "acid-rain-0.2.0-windows-x86_64/"
+            manifest = dict(reversed(line.split("  ", 1)) for line in
+                            archive.read(prefix + "SHA256SUMS").decode().splitlines())
+            for source, name in [("vendor/wgpu-core/LICENSE.MIT", "LICENSE.MIT"),
+                                 ("vendor/wgpu-core/LICENSE.APACHE", "LICENSE.APACHE"),
+                                 ("vendor/README.md", "README.md"),
+                                 ("vendor/wgpu-core-backport.patch", "wgpu-core-backport.patch"),
+                                 ("vendor/wgpu-core-provenance.json", "wgpu-core-provenance.json")]:
+                relative = "third-party-notices/wgpu-core/" + name
+                content = archive.read(prefix + relative)
+                if name == "README.md":
+                    self.assertTrue(content.endswith((self.repo / source).read_bytes()))
+                    self.assertIn(b'https://github.com/Yamp/acid-rain/tree/v0.2.0/vendor/wgpu-core', content)
+                else:
+                    self.assertEqual(content, (self.repo / source).read_bytes())
+                self.assertEqual(hashlib.sha256(content).hexdigest(), manifest[relative])
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS bundle signing needs codesign")
     def test_macos_bundle_signature_survives_archiving(self):

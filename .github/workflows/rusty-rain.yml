@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       windows-probe:
-        description: Run only the Windows timestamp diagnostic; cannot produce release archives.
+        description: Run only Windows GPU diagnostics; cannot produce release archives.
         required: false
         default: false
         type: boolean
@@ -86,6 +86,15 @@ jobs:
           # Preserve compiled dependencies when later GPU execution fails.
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Prepare checksum-verified Windows shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          uv run --no-project --python 3.14 python scripts/prepare_dxc.py --output-dir "target/${{ matrix.target }}/release"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $compiler = (Resolve-Path "target/${{ matrix.target }}/release/dxcompiler.dll").Path
+          "ACID_RAIN_DXC_PATH=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Copy-Item "target/${{ matrix.target }}/release/dxc-provenance.json" artifacts/dxc-provenance.json
       - name: Install Linux window-system and software Vulkan dependencies
         if: runner.os == 'Linux'
         run: |
@@ -105,7 +114,7 @@ jobs:
       - name: CPU tests and WGSL validation
         run: cargo test --locked --workspace --all-targets --release --target "${{ matrix.target }}" 2>&1 | tee artifacts/cpu-and-shader-tests.log
       - name: Check release archive integrity tests
-        run: uv run --no-project --python 3.14 python -m unittest discover -s scripts -p test_package_release.py
+        run: uv run --no-project --python 3.14 python -m unittest discover -s scripts -p 'test_*.py'
       - name: Build portable desktop and terminal
         id: portable-build
         run: cargo build --locked --release --target "${{ matrix.target }}" -p acid-rain -p acid-rain-desktop
@@ -120,9 +129,10 @@ jobs:
           $dumpbin = Join-Path $toolset.FullName 'bin/Hostx64/x64/dumpbin.exe'
           if (!(Test-Path $dumpbin -PathType Leaf)) { throw 'dumpbin.exe was not found.' }
           Set-Content artifacts/windows-pe-tool.txt $dumpbin
-          foreach ($name in @('acid-rain', 'acid-rain-desktop')) {
-            $binary = "target/${{ matrix.target }}/release/$name.exe"
-            $log = "artifacts/windows-pe-$name.log"
+          foreach ($name in @('acid-rain.exe', 'acid-rain-desktop.exe', 'dxcompiler.dll')) {
+            $binary = "target/${{ matrix.target }}/release/$name"
+            $stem = [IO.Path]::GetFileNameWithoutExtension($name)
+            $log = "artifacts/windows-pe-$stem.log"
             & $dumpbin /dependents /imports $binary 2>&1 | Set-Content $log
             if ($LASTEXITCODE -ne 0) { throw "PE import inspection failed: $name" }
             Select-String -Path $log -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique
@@ -230,6 +240,9 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/acid-rain.exe
             target/x86_64-pc-windows-msvc/release/acid-rain-desktop.exe
+            target/x86_64-pc-windows-msvc/release/dxcompiler.dll
+            target/x86_64-pc-windows-msvc/release/dxc-provenance.json
+            target/x86_64-pc-windows-msvc/release/licenses/dxc/
           if-no-files-found: warn
           retention-days: 14
   windows-probe:
@@ -246,6 +259,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          python-version: "3.14"
+          enable-cache: false
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
@@ -278,6 +296,14 @@ jobs:
           Set-Content artifacts/NOT-A-RELEASE.txt 'Windows-only diagnostic. This run does not validate all platforms and cannot supply release archives. Debug validation and serialized passes are diagnostic overhead; software-driver timings are not hardware GPU performance measurements.'
       - name: Check locked desktop before compilation
         run: cargo check --locked -p acid-rain-desktop --all-targets --target x86_64-pc-windows-msvc
+      - name: Prepare checksum-verified Windows shader compiler
+        shell: pwsh
+        run: |
+          uv run --no-project --python 3.14 python scripts/prepare_dxc.py --output-dir target/x86_64-pc-windows-msvc/release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $compiler = (Resolve-Path target/x86_64-pc-windows-msvc/release/dxcompiler.dll).Path
+          "ACID_RAIN_DXC_PATH=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Copy-Item target/x86_64-pc-windows-msvc/release/dxc-provenance.json artifacts/dxc-provenance.json
       - name: Build portable desktop
         run: cargo build --locked --release -p acid-rain-desktop --target x86_64-pc-windows-msvc
       - name: Run independent timestamp and full-scene probes
@@ -331,7 +357,7 @@ jobs:
           $results.no_timestamps_capture = Invoke-Probe -Name 'no-timestamps-capture' -Program $binary -Arguments ($common + @('--no-gpu-timestamps', '--output', 'artifacts/no-timestamps-capture.png', '--report', 'artifacts/no-timestamps-capture.json'))
           $results.serialized_capture = Invoke-Probe -Name 'serialized-capture' -Program $binary -Arguments ($common + @('--diagnose-gpu-passes', '--output', 'artifacts/serialized-capture.png', '--report', 'artifacts/serialized-capture.json'))
           $results.serialized_no_timestamps_capture = Invoke-Probe -Name 'serialized-no-timestamps-capture' -Program $binary -Arguments ($common + @('--diagnose-gpu-passes', '--no-gpu-timestamps', '--output', 'artifacts/serialized-no-timestamps-capture.png', '--report', 'artifacts/serialized-no-timestamps-capture.json'))
-          # DEBUG disables FXC optimization; isolate that variable from native validation.
+          # DEBUG disables shader optimization; isolate that variable from native validation.
           $env:WGPU_DEBUG = '1'
           try {
             $results.unoptimized_capture = Invoke-Probe -Name 'unoptimized-capture' -Program $binary -Arguments ($common + @('--output', 'artifacts/unoptimized-capture.png', '--report', 'artifacts/unoptimized-capture.json'))

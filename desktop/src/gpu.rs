@@ -3,6 +3,7 @@
 mod diagnostic;
 mod errors;
 mod pipelines;
+mod platform;
 mod profiling;
 mod resources;
 use std::{
@@ -37,6 +38,10 @@ use errors::{
     ErrorSource,
 };
 use pipelines::*;
+pub use platform::{
+    ConfiguredInstance,
+    create_instance,
+};
 pub use profiling::GpuTiming;
 use profiling::{
     TimingSlot,
@@ -201,6 +206,7 @@ pub struct GpuRenderer {
     pub hardware_filtering: bool,
     pub timestamp_queries: bool,
     pub common_sampler_layout: wgpu::BindGroupLayout,
+    pub shader_compiler: &'static str,
     driver_debug: bool,
     pub common_samplers: wgpu::BindGroup,
     timers: Option<[TimingSlot; 3]>,
@@ -253,11 +259,8 @@ impl GpuRenderer {
         let instance_flags = wgpu::InstanceFlags::from_env_or_default();
         let driver_debug =
             instance_flags.intersects(wgpu::InstanceFlags::DEBUG | wgpu::InstanceFlags::VALIDATION);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            flags: instance_flags,
-            ..Default::default()
-        });
+        let configured = create_instance(backends, instance_flags)?;
+        let instance = &configured.instance;
         let surface = window
             .map(|window| instance.create_surface(window))
             .transpose()
@@ -274,6 +277,7 @@ impl GpuRenderer {
                  driver or select another --backend",
             )?;
         let adapter_info = adapter.get_info();
+        let shader_compiler = configured.shader_compiler(adapter_info.backend);
         let hardware_filtering = adapter
             .features()
             .contains(wgpu::Features::FLOAT32_FILTERABLE);
@@ -477,6 +481,7 @@ impl GpuRenderer {
             adapter_info,
             hardware_filtering,
             timestamp_queries,
+            shader_compiler,
             driver_debug,
             timers,
             slot_busy: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),

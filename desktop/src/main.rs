@@ -222,6 +222,7 @@ fn headless(o: &Options) -> anyhow::Result<()> {
     let report = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"), "adapter": gpu.adapter_info.name,
         "backend": format!("{:?}", gpu.adapter_info.backend), "device_type": format!("{:?}", gpu.adapter_info.device_type),
+        "shader_compiler": gpu.shader_compiler,
         "software_requested": o.software, "hardware_filtering": gpu.hardware_filtering,
         "width": width, "height": height, "render_width": outcome.width, "render_height": outcome.height,
         "frames": o.frames, "warmup": o.warmup, "seed": o.seed, "quality": o.quality.render().name(),

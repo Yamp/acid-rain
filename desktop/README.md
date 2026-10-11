@@ -12,6 +12,11 @@ launchers, documentation, license and SHA-256 checksums. A Rust installation is 
 required. GPU shaders are embedded in the desktop executable.
 Windows release executables link the MSVC runtime statically and do not require
 installing the Visual C++ redistributable.
+The Windows archive includes Microsoft's DXC shader compiler, its licenses and
+checksum provenance. Keep `dxcompiler.dll` beside the desktop executable for
+DirectX 12; explicit `--backend vulkan` does not need that DLL.
+DirectX 12 requires Shader Model 6 support and negotiates the device-supported
+version up to Shader Model 6.7.
 
 - Windows: extract the ZIP and double-click `acid-rain-desktop.exe`. The optional
   `Start Desktop.cmd` helper starts the graphical app and closes its command window.
@@ -46,6 +51,19 @@ sudo apt-get install build-essential pkg-config libx11-dev libxi-dev libxcursor-
 ```
 
 Windows builds use the MSVC Rust toolchain and Visual Studio C++ Build Tools.
+Before running a Windows DirectX 12 build, install the pinned compiler with
+Python 3.14 and [uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv run --no-project --python 3.14 python scripts/prepare_dxc.py --output-dir target/release
+$env:ACID_RAIN_DXC_PATH = (Resolve-Path target/release/dxcompiler.dll).Path
+```
+
+The helper verifies the official archive checksum and extracts the compiler,
+licenses and provenance. The absolute `ACID_RAIN_DXC_PATH` override also lets test
+executables under `target/release/deps` find the same compiler. With an explicit
+Cargo target, replace `target/release` with `target/<target-triple>/release`.
+
 macOS builds use Xcode Command Line Tools. Portable releases do not use
 `-C target-cpu=native`; that option is only suitable for binaries built for your own CPU.
 Build the original native app with `ACID_RAIN_PORTABLE=1 ./native/build.sh` when packaging it.

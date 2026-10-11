@@ -23,6 +23,17 @@ TARGETS = {
     "x86_64-apple-darwin": "macos-x86_64",
 }
 
+VENDOR_NOTICES = {
+    "vendor/wgpu-core/LICENSE.MIT": "LICENSE.MIT",
+    "vendor/wgpu-core/LICENSE.APACHE": "LICENSE.APACHE",
+    "vendor/README.md": "README.md",
+    "vendor/wgpu-core-backport.patch": "wgpu-core-backport.patch",
+    "vendor/wgpu-core-provenance.json": "wgpu-core-provenance.json",
+}
+
+DXC_FILES = ["dxcompiler.dll", "licenses/dxc/LICENCE-MIT.txt", "licenses/dxc/LICENSE-LLVM.txt",
+             "licenses/dxc/LICENSE-MS.txt"]
+
 
 def digest(path: Path) -> str:
     with path.open("rb") as file:
@@ -91,9 +102,20 @@ def package(args: argparse.Namespace) -> Path:
     windows, macos = "windows" in args.target, "apple" in args.target
     suffix = ".exe" if windows else ""
     for file in [binaries / ("acid-rain" + suffix), binaries / ("acid-rain-desktop" + suffix),
-                 repo / "LICENSE", repo / "README.md", repo / "desktop/README.md"]:
+                 repo / "LICENSE", repo / "README.md", repo / "desktop/README.md",
+                 *(repo / source for source in VENDOR_NOTICES)]:
         if not file.is_file():
             raise ValueError(f"Missing required release file: {file}")
+    if windows:
+        for relative in [*DXC_FILES, "dxc-provenance.json"]:
+            if not (binaries / relative).is_file():
+                raise ValueError(f"Missing required Windows compiler file: {relative}; run scripts/prepare_dxc.py first")
+        provenance = json.loads((binaries / "dxc-provenance.json").read_text(encoding="utf-8"))
+        if provenance.get("architecture") != "x64":
+            raise ValueError("Windows release requires the x64 DXC compiler")
+        for relative in DXC_FILES:
+            if provenance.get("files", {}).get(relative) != digest(binaries / relative):
+                raise ValueError(f"DXC provenance checksum mismatch: {relative}")
     if args.native_app and (not macos or not (args.native_app / "Contents/MacOS/AcidRain").is_file()):
         raise ValueError("--native-app requires a built macOS Acid Rain.app")
     output.mkdir(parents=True, exist_ok=True)
@@ -104,9 +126,23 @@ def package(args: argparse.Namespace) -> Path:
         for binary in ["acid-rain", "acid-rain-desktop"]:
             copy_executable(binaries / (binary + suffix), stage / (binary + suffix))
         shutil.copyfile(repo / "LICENSE", stage / "LICENSE")
+        notices = stage / "third-party-notices/wgpu-core"
+        notices.mkdir(parents=True)
+        for source, destination in VENDOR_NOTICES.items():
+            if destination == "README.md":
+                text(notices / destination,
+                     "This archive includes notices, provenance and the patch. The complete patched source is "
+                     f"[available with this release](https://github.com/Yamp/acid-rain/tree/v{version}/vendor/wgpu-core). "
+                     "The original source-package documentation follows.\n\n" + (repo / source).read_text(encoding="utf-8"))
+            else:
+                shutil.copyfile(repo / source, notices / destination)
         for source, destination in [("README.md", "README.md"), ("desktop/README.md", "DESKTOP.md")]:
             text(stage / destination, release_markdown(repo, repo / source, version))
         if windows:
+            for relative in [*DXC_FILES, "dxc-provenance.json"]:
+                destination = stage / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(binaries / relative, destination)
             for label, binary in [("Desktop", "acid-rain-desktop"), ("Terminal", "acid-rain")]:
                 launch = 'start "" ' if label == "Desktop" else ""
                 text(stage / f"Start {label}.cmd", f'@echo off\r\ncd /d "%~dp0"\r\n{launch}"%~dp0{binary}.exe" %*\r\n')
@@ -141,11 +177,13 @@ macOS: open Acid Rain Desktop.app; the optional Acid Rain Metal.app is the origi
 
 Press h in the graphical app for controls. Command-line options: acid-rain-desktop{suffix} --help
 Windows: DirectX 12 (Vulkan can be selected with --backend vulkan).
+Keep the bundled dxcompiler.dll beside the Windows desktop executable for DirectX 12.
 Linux: Vulkan driver; Ubuntu 22.04 / glibc 2.35 or newer; both X11 and Wayland are supported.
 macOS: Metal, macOS 14 or newer. Select the arm64 archive for Apple Silicon or x86_64 for Intel.
 No Rust toolchain is required to run these binaries. GPU shaders are embedded.
 
 See DESKTOP.md and README.md. LICENSE contains the Apache-2.0 license.
+Vendored wgpu-core licenses and backport provenance are in third-party-notices/wgpu-core.
 SHA256SUMS checks every regular file in this directory. The separately published
 SHA256SUMS checks the downloaded archives. Release binaries are not notarized;
 macOS apps are ad-hoc signed. They do not have a paid developer signature.

@@ -39,17 +39,22 @@ pub fn gpu_with_optional_features(features: wgpu::Features) -> Option<Gpu> {
         Err(_) => wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
         Ok(value) => panic!("unsupported WGPU_BACKEND={value}; use metal, vulkan or dx12"),
     };
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let configured = acid_rain_desktop::gpu::create_instance(
         backends,
-        ..Default::default()
-    });
+        wgpu::InstanceFlags::from_env_or_default(),
+    )
+    .expect("GPU fixture compiler initialization failed");
+    let instance = &configured.instance;
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
         ..Default::default()
     }))
     .expect("GPU tests were requested but no matching adapter is available");
     let adapter_info = adapter.get_info();
-    eprintln!("GPU fixture adapter: {adapter_info:?}");
+    eprintln!(
+        "GPU fixture adapter: {adapter_info:?}; shader compiler: {}",
+        configured.shader_compiler(adapter_info.backend)
+    );
     if !adapter.features().contains(features) {
         eprintln!(
             "Optional GPU path skipped: adapter lacks {:?}",

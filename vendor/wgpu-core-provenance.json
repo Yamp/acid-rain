@@ -1,0 +1,26 @@
+{
+  "crate": "wgpu-core",
+  "version": "27.0.3",
+  "archive_url": "https://static.crates.io/crates/wgpu-core/wgpu-core-27.0.3.crate",
+  "archive_sha256": "27a75de515543b1897b26119f93731b385a19aea165a1ec5f0e3acecc229cae7",
+  "registry_index_url": "https://github.com/rust-lang/crates.io-index/blob/master/wg/pu/wgpu-core",
+  "registry_sha256_verified": true,
+  "published_git": {
+    "git": {
+      "sha1": "d61dc3af8856f0cd9023c5e888b791d1b7118559"
+    },
+    "path_in_vcs": "wgpu-core"
+  },
+  "upstream_fix_pr": "https://github.com/gfx-rs/wgpu/pull/8760",
+  "upstream_fix_commit": "bdf7d9bb5d0f8d0c4d58f7e1ec3e214cece199a3",
+  "patch": "src/device/resource.rs: init_default_external_texture_params_buffer MAP_WRITE -> COPY_DST instead of COPY_SRC",
+  "original_source_sha256": "2d381aaf9ee0bff01bab69f12923bbedba2bb0bc7110f6648d6a641efae93001",
+  "patched_source_sha256": "9fb033ac65c2c439ca120247eb07bec4663b28e8eb0d6fde93de01c9484c1ab8",
+  "license": "MIT OR Apache-2.0",
+  "licenses_sha256": {
+    "LICENSE.MIT": "dc0d97139e8205818c703741c7be7cb3b96888bd5917b8d6fc6133731e403c21",
+    "LICENSE.APACHE": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+  },
+  "source_verification": "Compared every official package file against the checksum-verified archive; exactly the upstream one-line change is permitted. All 81 files and both licenses are retained. Source integrity is independent of runtime validation.",
+  "scope": "Repository-local Cargo patch. Registry sources and all other dependency versions remain unchanged."
+}
