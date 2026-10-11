@@ -45,6 +45,7 @@ dependencies = [
  "egui-winit",
  "half",
  "image",
+ "log",
  "naga",
  "pollster",
  "serde",

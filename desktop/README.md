@@ -10,6 +10,8 @@ Choose the archive for Windows x86-64, Linux x86-64, macOS Apple Silicon (arm64)
 or macOS Intel (x86-64). Each archive includes the desktop and terminal executables,
 launchers, documentation, license and SHA-256 checksums. A Rust installation is not
 required. GPU shaders are embedded in the desktop executable.
+Windows release executables link the MSVC runtime statically and do not require
+installing the Visual C++ redistributable.
 
 - Windows: extract the ZIP and double-click `acid-rain-desktop.exe`. The optional
   `Start Desktop.cmd` helper starts the graphical app and closes its command window.

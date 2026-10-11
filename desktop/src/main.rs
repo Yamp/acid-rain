@@ -23,6 +23,7 @@ use cli::Options;
 fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     windows_launch::attach_existing_console();
+    acid_rain_desktop::gpu::init_diagnostics_logging();
     let options = Options::parse();
     #[cfg(target_os = "windows")]
     let interactive = !options.headless;

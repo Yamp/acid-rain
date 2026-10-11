@@ -12,6 +12,11 @@ use std::{
     time::Instant,
 };
 
+use super::errors::{
+    Diagnostics,
+    ErrorSource,
+};
+
 #[derive(Clone, Copy, Debug)]
 pub struct GpuTiming {
     pub sequence: u64,
@@ -83,6 +88,7 @@ impl TimingSlot {
     #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &self,
+        queue: &wgpu::Queue,
         period: f32,
         sequence: u64,
         start: Instant,
@@ -90,9 +96,10 @@ impl TimingSlot {
         state: Arc<Mutex<TimingState>>,
         busy: Arc<AtomicBool>,
         in_flight: Arc<AtomicUsize>,
-        error: Arc<Mutex<Option<String>>>,
+        error: Arc<Mutex<Diagnostics>>,
     ) {
         let buffer = self.readback.clone();
+        let queue = queue.clone();
         self.readback
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
@@ -114,8 +121,16 @@ impl TimingSlot {
                         });
                     },
                     Err(failure) => {
-                        *error.lock().unwrap() =
-                            Some(format!("GPU timestamp readback failed: {failure}"));
+                        error.lock().unwrap().record(
+                            ErrorSource::Profiling,
+                            format!("GPU timestamp readback failed: {failure}"),
+                        );
+                        // An aborted map may arrive before submitted GPU work
+                        // completes. Keep this upload slot unavailable until
+                        // queue completion; a lost device remains fatal in the
+                        // independent diagnostics state.
+                        fallback_completion(&queue, sequence, start, depth, state, busy, in_flight);
+                        return;
                     },
                 }
                 busy.store(false, Ordering::Release);
@@ -123,6 +138,7 @@ impl TimingSlot {
             });
     }
 }
+
 pub fn fallback_completion(
     queue: &wgpu::Queue,
     sequence: u64,
@@ -142,4 +158,63 @@ pub fn fallback_completion(
         busy.store(false, Ordering::Release);
         in_flight.fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_timing_map_keeps_slot_busy_until_queue_completion() {
+        if std::env::var("ACID_RAIN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL | wgpu::Backends::VULKAN | wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
+            ..Default::default()
+        }))
+        .expect("GPU fixture requested but adapter unavailable");
+        if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return;
+        }
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::TIMESTAMP_QUERY,
+            ..Default::default()
+        }))
+        .unwrap();
+        let slot = TimingSlot::new(&device);
+        let state = Arc::new(Mutex::new(TimingState::default()));
+        let error = Arc::new(Mutex::new(Diagnostics::default()));
+        let busy = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        slot.complete(
+            &queue,
+            queue.get_timestamp_period(),
+            7,
+            Instant::now(),
+            1,
+            state.clone(),
+            busy.clone(),
+            in_flight.clone(),
+            error.clone(),
+        );
+        slot.readback.unmap();
+        assert!(
+            busy.load(Ordering::Acquire),
+            "failed optional map released a live frame slot"
+        );
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
+        assert!(error.lock().unwrap().profiling_warning().is_some());
+        assert!(error.lock().unwrap().fatal().is_none());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(!busy.load(Ordering::Acquire));
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        let timing = state.lock().unwrap().last.unwrap();
+        assert_eq!(timing.sequence, 7);
+        assert_eq!(timing.gpu_ms, None);
+    }
 }

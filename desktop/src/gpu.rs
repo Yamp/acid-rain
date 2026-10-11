@@ -1,5 +1,6 @@
 //! The same bounded render graph serves the window, screenshots and GPU fixtures.
 //! All optical textures are scene-linear until the final sRGB attachment.
+mod errors;
 mod pipelines;
 mod profiling;
 mod resources;
@@ -28,6 +29,11 @@ use anyhow::{
     Result,
     bail,
     ensure,
+};
+pub use errors::init_diagnostics_logging;
+use errors::{
+    Diagnostics,
+    ErrorSource,
 };
 use pipelines::*;
 pub use profiling::GpuTiming;
@@ -225,7 +231,7 @@ pub struct GpuRenderer {
     has_rendered: bool,
     picking: Option<(OwnedSnapshot, ARUniforms)>,
     in_flight: Arc<AtomicUsize>,
-    error: Arc<Mutex<Option<String>>>,
+    error: Arc<Mutex<Diagnostics>>,
 }
 impl GpuRenderer {
     pub async fn new(
@@ -315,14 +321,20 @@ impl GpuRenderer {
             })
             .await
             .context("Cannot initialize the requested GPU device")?;
-        let error = Arc::new(Mutex::new(None));
+        let error = Arc::new(Mutex::new(Diagnostics::default()));
         let errors = error.clone();
         device.on_uncaptured_error(Arc::new(move |failure: wgpu::Error| {
-            *errors.lock().unwrap() = Some(failure.to_string());
+            errors
+                .lock()
+                .unwrap()
+                .record(ErrorSource::Rendering, failure.to_string());
         }));
         let errors = error.clone();
         device.set_device_lost_callback(move |reason, message| {
-            *errors.lock().unwrap() = Some(format!("GPU device lost ({reason:?}): {message}"));
+            errors.lock().unwrap().record(
+                ErrorSource::DeviceLost,
+                format!("GPU device lost ({reason:?}): {message}"),
+            );
         });
         let width = config.width.max(1);
         let height = config.height.max(1);
@@ -533,8 +545,10 @@ impl GpuRenderer {
         if width > self.device.limits().max_texture_dimension_2d
             || height > self.device.limits().max_texture_dimension_2d
         {
-            *self.error.lock().unwrap() =
-                Some("Window dimensions exceed GPU texture limits".into());
+            self.error.lock().unwrap().record(
+                ErrorSource::Rendering,
+                "Window dimensions exceed GPU texture limits".into(),
+            );
             return;
         }
         if let Some(config) = self.surface_config.as_mut() {
@@ -577,15 +591,17 @@ impl GpuRenderer {
             .offline
             .as_ref()
             .context("Capture requires the headless renderer")?;
-        let result = read_texture_bytes(&self.device, &self.queue, &texture.texture, 4)?;
+        let result = read_texture_bytes(&self.device, &self.queue, &texture.texture, 4);
         self.check_error()?;
-        Ok(result)
+        result
     }
 
     /// Explicit synchronization for captures/tests only; interactive rendering never waits.
     pub fn wait_idle(&self) -> Result<()> {
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        self.check_error()
+        let result = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.check_error()?;
+        result?;
+        Ok(())
     }
 
     pub fn take_timings(&self) -> Vec<GpuTiming> {
@@ -597,12 +613,20 @@ impl GpuRenderer {
             .collect()
     }
 
+    pub fn profiling_warning(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap()
+            .profiling_warning()
+            .map(str::to_owned)
+    }
+
     pub fn cloud_texture(&self) -> &wgpu::Texture { &self.clouds[self.cloud_index].texture }
 
     pub fn caustics_texture(&self) -> &wgpu::Texture { &self.caustics_light.texture }
 
     fn check_error(&self) -> Result<()> {
-        if let Some(message) = self.error.lock().unwrap().as_ref() {
+        if let Some(message) = self.error.lock().unwrap().fatal() {
             bail!("{message}");
         }
         Ok(())
@@ -625,8 +649,17 @@ impl GpuRenderer {
         ),
     {
         let started = Instant::now();
-        self.device.poll(wgpu::PollType::Poll)?;
+        let polled = self.device.poll(wgpu::PollType::Poll);
         self.check_error()?;
+        polled?;
+        if self.timers.is_some() && self.profiling_warning().is_some() {
+            self.timers = None;
+            self.timestamp_queries = false;
+            eprintln!(
+                "{}; using queue-completion measurements",
+                self.profiling_warning().unwrap()
+            );
+        }
         if self.width == 0 || self.height == 0 {
             return Ok(RenderOutcome::default());
         }
@@ -634,7 +667,9 @@ impl GpuRenderer {
             if self.surface.is_some() {
                 return Ok(RenderOutcome::default());
             }
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let polled = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.check_error()?;
+            polled?;
         }
         let slot_index = (0..3)
             .map(|offset| (self.next_slot + offset) % 3)
@@ -694,6 +729,7 @@ impl GpuRenderer {
         self.sequence += 1;
         if let Some(timers) = &self.timers {
             timers[slot_index].complete(
+                &self.queue,
                 self.queue.get_timestamp_period(),
                 self.sequence,
                 Instant::now(),

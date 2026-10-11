@@ -31,6 +31,8 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +76,8 @@ jobs:
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET ACID_RAIN_PORTABLE
           cache-bin: false
           cache-workspace-crates: false
-          cache-on-failure: false
+          # Preserve compiled dependencies when later GPU execution fails.
+          cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install Linux window-system and software Vulkan dependencies
         if: runner.os == 'Linux'
@@ -98,6 +101,27 @@ jobs:
         run: uv run --no-project --python 3.14 python -m unittest discover -s scripts -p test_package_release.py
       - name: Build portable desktop and terminal
         run: cargo build --locked --release --target "${{ matrix.target }}" -p acid-rain -p acid-rain-desktop
+      - name: Inspect Windows runtime imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$installation) { throw 'Visual Studio C++ tools were not found.' }
+          $toolset = Get-ChildItem (Join-Path $installation 'VC/Tools/MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $toolset.FullName 'bin/Hostx64/x64/dumpbin.exe'
+          if (!(Test-Path $dumpbin -PathType Leaf)) { throw 'dumpbin.exe was not found.' }
+          Set-Content artifacts/windows-pe-tool.txt $dumpbin
+          foreach ($name in @('acid-rain', 'acid-rain-desktop')) {
+            $binary = "target/${{ matrix.target }}/release/$name.exe"
+            $log = "artifacts/windows-pe-$name.log"
+            & $dumpbin /dependents /imports $binary 2>&1 | Set-Content $log
+            if ($LASTEXITCODE -ne 0) { throw "PE import inspection failed: $name" }
+            Select-String -Path $log -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique
+            if (Select-String -Path $log -Pattern '\b(?:VCRUNTIME|MSVCP|MSVCR[0-9]|CONCRT|VCOMP)[^\s]*\.dll\b' -Quiet) {
+              throw "Portable executable depends on a Visual C++ redistributable DLL: $name"
+            }
+          }
       - name: Required real shader execution on Linux software Vulkan
         if: runner.os == 'Linux'
         env:
@@ -123,7 +147,16 @@ jobs:
               Set-Content artifacts/windows-warp-SKIPPED.txt 'SKIPPED: the hosted runner exposes no compatible software DX12 adapter.'
               Write-Output '::warning::WARP adapter unavailable; Windows GPU execution was not verified. See validation evidence.'
             } else {
-              exit $process.ExitCode
+              $primaryExitCode = $process.ExitCode
+              try {
+                $probe = Start-Process -FilePath "target/${{ matrix.target }}/release/acid-rain-desktop.exe" -ArgumentList @('--headless', '--backend', 'dx12', '--software', '--quality', 'low', '--frames', '12', '--warmup', '2', '--size', '64x40', '--output', 'artifacts/windows-warp-low.png', '--report', 'artifacts/windows-warp-low.json') -Wait -PassThru -NoNewWindow -RedirectStandardOutput artifacts/windows-warp-low.stdout.log -RedirectStandardError artifacts/windows-warp-low.stderr.log
+                Set-Content artifacts/windows-warp-low.exitcode.txt $probe.ExitCode
+                Get-Content artifacts/windows-warp-low.stdout.log, artifacts/windows-warp-low.stderr.log | Set-Content artifacts/windows-warp-low.log
+                Get-Content artifacts/windows-warp-low.log
+              } catch {
+                $_ | Out-String | Set-Content artifacts/windows-warp-low-launch-error.log
+              }
+              exit $primaryExitCode
             }
           } elseif (!(Test-Path artifacts/windows-warp.png -PathType Leaf) -or !(Test-Path artifacts/windows-warp.json -PathType Leaf)) {
             throw 'The headless GUI process exited successfully without its PNG and JSON capture.'
@@ -171,5 +204,15 @@ jobs:
         with:
           name: checks-${{ matrix.target }}
           path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve Windows binaries for failure diagnosis
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diagnostics-windows-binaries
+          path: |
+            target/x86_64-pc-windows-msvc/release/acid-rain.exe
+            target/x86_64-pc-windows-msvc/release/acid-rain-desktop.exe
           if-no-files-found: warn
           retention-days: 14
