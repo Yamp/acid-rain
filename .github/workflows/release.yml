@@ -2,84 +2,66 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.target_name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target_name: linux
-            bin_path: target/release/acid-rain
-            bin_name: acid-rain
-            archive_ext: tar.gz
-          - os: macos-latest
-            target_name: macos
-            bin_path: target/release/acid-rain
-            bin_name: acid-rain
-            archive_ext: tar.gz
-          - os: windows-latest
-            target_name: windows
-            bin_path: target/release/acid-rain.exe
-            bin_name: acid-rain.exe
-            archive_ext: zip
-
+  checks:
+    uses: ./.github/workflows/rusty-rain.yml
+    with:
+      release-version: ${{ github.ref_name }}
+  publish:
+    name: Publish validated archives
+    if: github.repository == 'Yamp/acid-rain'
+    needs: checks
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Package archive (Linux/macOS)
-        if: matrix.archive_ext == 'tar.gz'
-        shell: bash
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          python-version: "3.14"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: checks-*
+          path: checks
+      - name: Verify all four platform archives and package validation evidence
         run: |
-          mkdir -p dist
-          cp "${{ matrix.bin_path }}" "dist/${{ matrix.bin_name }}"
-          chmod +x "dist/${{ matrix.bin_name }}"
-          tar -czf "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -C dist "${{ matrix.bin_name }}"
-
-      - name: Package archive (Windows)
-        if: matrix.archive_ext == 'zip'
-        shell: pwsh
+          uv run --no-project --python 3.14 python scripts/package_release.py manifest --directory dist --expected 4
+          uv run --no-project --python 3.14 python - <<'PY'
+          import hashlib, os, pathlib, shutil
+          root = pathlib.Path('checks')
+          (root / 'README.txt').write_text(
+              'Validation of commit ' + os.environ['GITHUB_SHA'] + '\n'
+              'All platform build, CPU test and WGSL validation jobs passed.\n'
+              'Linux Vulkan capture executes the actual GPU pipeline on a software driver.\n'
+              'Windows WARP execution is attempted; an unavailable adapter is explicitly marked SKIPPED.\n'
+              'Software timings are NOT hardware GPU FPS claims.\n'
+              'Workflow: https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '\n')
+          archive = pathlib.Path(shutil.make_archive('dist/validation', 'zip', root))
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_name(archive.name + '.sha256').write_text(f'{digest}  {archive.name}\n')
+          PY
+          uv run --no-project --python 3.14 python scripts/package_release.py manifest --directory dist --expected 5
+      - name: Publish release with archives, verification evidence and SHA-256 manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item "${{ matrix.bin_path }}" "dist/${{ matrix.bin_name }}"
-          Compress-Archive -Path "dist/${{ matrix.bin_name }}" -DestinationPath "acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}" -Force
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: acid-rain-${{ matrix.target_name }}
-          path: acid-rain-${{ github.ref_name }}-${{ matrix.target_name }}.${{ matrix.archive_ext }}
-          if-no-files-found: error
-
-  release:
-    name: Publish GitHub Release
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Publish release with assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
-          generate_release_notes: true
+          gh release create "$RELEASE_TAG" --verify-tag --title "Acid Rain $RELEASE_TAG" --generate-notes dist/*.tar.gz dist/*.zip dist/SHA256SUMS

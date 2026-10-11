@@ -1,0 +1,15 @@
+[package]
+name = "acid-rain-native-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+clap = { version = "=4.4.18", features = ["derive"] }
+rand = "=0.8.5"
+ndarray = "=0.15.6"
+once_cell = "1.21"

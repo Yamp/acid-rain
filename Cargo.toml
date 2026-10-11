@@ -1,9 +1,10 @@
 [package]
 name = "acid-rain"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["yampolson <https://github.com/Yamp>"]
-edition = "2021"
-description = "Emulate screensaver."
+edition = "2024"
+rust-version = "1.88"
+description = "Psychedelic water, pigment and light simulation for desktop and terminal."
 repository = "https://github.com/Yamp/acid-rain"
 documentation = "https://docs.rs/acid-rain"
 homepage = "https://github.com/Yamp/acid-rain"
@@ -13,7 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 clap = {version = "^4.4.18", features = ["derive", "unstable-v5", "wrap_help"]}
-crossterm = "^0.27.0"
+crossterm = {version = "^0.27.0", features = ["use-dev-tty"]}
 rand = "^0.8.5"
 itertools = "^0.12.0"
 ezemoji = "^0.2.1"
@@ -32,3 +33,8 @@ opt-level = 3
 overflow-checks = false  # Disable integer overflow checks.
 panic = "unwind"
 # rustflags requires nightly cargo-features; use RUSTFLAGS env var instead
+
+[workspace]
+members = [".", "desktop", "native/core"]
+default-members = ["."]
+resolver = "3"

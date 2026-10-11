@@ -1,5 +1,12 @@
 # Rust-specific
 /target
+/native/core/target
+/native/build
+/desktop/target
+/benchmarks
+/native/artifacts
+/artifacts
+/dist
 **/*.rs.bk
 
 # Generated files
@@ -9,3 +16,4 @@
 .vscode
 .idea
 *.swp
+__pycache__/

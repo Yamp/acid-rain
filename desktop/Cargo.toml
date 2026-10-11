@@ -1,0 +1,27 @@
+[package]
+name = "acid-rain-desktop"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+license = "Apache-2.0"
+description = "GPU water and psychedelic optics for Windows, Linux and macOS"
+
+[dependencies]
+acid-rain-native-core = { path = "../native/core" }
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "=4.4.18", features = ["derive"] }
+egui = "=0.33.3"
+egui-wgpu = "=0.33.3"
+egui-winit = "=0.33.3"
+half = { version = "2", features = ["bytemuck"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "=27.0.1"
+winit = "=0.30.12"
+
+[dev-dependencies]
+naga = { version = "=27.0.3", features = ["wgsl-in"] }
