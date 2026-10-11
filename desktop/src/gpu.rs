@@ -1,5 +1,6 @@
 //! The same bounded render graph serves the window, screenshots and GPU fixtures.
 //! All optical textures are scene-linear until the final sRGB attachment.
+mod diagnostic;
 mod errors;
 mod pipelines;
 mod profiling;
@@ -229,6 +230,7 @@ pub struct GpuRenderer {
     consumed: HashSet<u64>,
     previous_mode: Option<[u32; 2]>,
     has_rendered: bool,
+    diagnose_passes: bool,
     picking: Option<(OwnedSnapshot, ARUniforms)>,
     in_flight: Arc<AtomicUsize>,
     error: Arc<Mutex<Diagnostics>>,
@@ -499,6 +501,7 @@ impl GpuRenderer {
             consumed: HashSet::new(),
             previous_mode: None,
             has_rendered: false,
+            diagnose_passes: false,
             picking: None,
             in_flight: Arc::new(AtomicUsize::new(0)),
             error,
@@ -529,6 +532,23 @@ impl GpuRenderer {
     ) -> wgpu::ShaderModule {
         pipelines::shader(&self.device, kind, self.hardware_filtering)
     }
+
+    /// Diagnostic-only: serialize the unchanged production graph at pass boundaries.
+    /// Never valid for performance measurement or interactive presentation.
+    pub fn enable_pass_diagnostics(&mut self) -> Result<()> {
+        ensure!(
+            self.surface.is_none(),
+            "GPU pass diagnostics require headless rendering"
+        );
+        ensure!(
+            !self.has_rendered,
+            "Enable GPU pass diagnostics before rendering"
+        );
+        self.diagnose_passes = true;
+        Ok(())
+    }
+
+    pub fn pass_diagnostics_enabled(&self) -> bool { self.diagnose_passes }
 
     pub fn resize(
         &mut self,
@@ -625,12 +645,7 @@ impl GpuRenderer {
 
     pub fn caustics_texture(&self) -> &wgpu::Texture { &self.caustics_light.texture }
 
-    fn check_error(&self) -> Result<()> {
-        if let Some(message) = self.error.lock().unwrap().fatal() {
-            bail!("{message}");
-        }
-        Ok(())
-    }
+    fn check_error(&self) -> Result<()> { errors::check(&self.device, &self.error) }
 
     pub fn render<F>(
         &mut self,
@@ -722,6 +737,15 @@ impl GpuRenderer {
         );
         if let Some(timers) = &self.timers {
             timers[slot_index].resolve(&mut encoder);
+            diagnostic::checkpoint(
+                self.diagnose_passes,
+                "timestamp resolve/copy",
+                &mut encoder,
+                &self.device,
+                &self.queue,
+                &self.slots[slot_index].uniforms,
+                &self.error,
+            )?;
         }
         self.slot_busy[slot_index].store(true, Ordering::Release);
         let depth = self.in_flight.fetch_add(1, Ordering::AcqRel) as u32 + 1;
@@ -752,6 +776,11 @@ impl GpuRenderer {
         }
         if let Some(acquired) = acquired {
             acquired.present();
+        }
+        if self.diagnose_passes {
+            eprintln!("GPU CHECKPOINT BEGIN final completion/timestamp mapping");
+            self.wait_idle()?;
+            eprintln!("GPU CHECKPOINT PASS final completion/timestamp mapping");
         }
         self.has_rendered = true;
         Ok(RenderOutcome {
@@ -897,6 +926,15 @@ impl GpuRenderer {
                 pass.draw(0..6, 0..airborne);
             }
         }
+        diagnostic::checkpoint(
+            self.diagnose_passes,
+            "water/droplets",
+            encoder,
+            &self.device,
+            &self.queue,
+            &slot.uniforms,
+            &self.error,
+        )?;
         let retina = self.retina_policy.advance(input.delta, held);
         if retina.update {
             let next = 1 - self.retina_index;
@@ -926,6 +964,19 @@ impl GpuRenderer {
                         1,
                     ],
                 );
+                diagnostic::checkpoint(
+                    self.diagnose_passes,
+                    [
+                        "retinal reservoir fast",
+                        "retinal reservoir middle",
+                        "retinal reservoir slow",
+                    ][layer],
+                    encoder,
+                    &self.device,
+                    &self.queue,
+                    &slot.uniforms,
+                    &self.error,
+                )?;
             }
             self.retina_index = next;
         }
@@ -942,6 +993,15 @@ impl GpuRenderer {
             &self.common_samplers,
             [1, 1, 1],
         );
+        diagnostic::checkpoint(
+            self.diagnose_passes,
+            "pupil exposure",
+            encoder,
+            &self.device,
+            &self.queue,
+            &slot.uniforms,
+            &self.error,
+        )?;
         uniforms.viewport = Float4([
             self.width as f32,
             self.height as f32,
@@ -981,6 +1041,15 @@ impl GpuRenderer {
             pass.set_bind_group(1, &self.common_samplers, &[]);
             pass.draw(0..3, 0..1);
         }
+        diagnostic::checkpoint(
+            self.diagnose_passes,
+            "retinal post/sRGB output",
+            encoder,
+            &self.device,
+            &self.queue,
+            &slot.uniforms,
+            &self.error,
+        )?;
         slot.uniforms.upload(&self.queue);
         self.history_index = previous;
         self.history_valid = true;
@@ -1015,6 +1084,15 @@ impl GpuRenderer {
             [17, 17, 3],
             start_timer.take(),
         );
+        diagnostic::checkpoint(
+            self.diagnose_passes,
+            "caustics map",
+            encoder,
+            &self.device,
+            &self.queue,
+            &slot.uniforms,
+            &self.error,
+        )?;
         let triangles = bind(&self.device, &self.pipelines.caustics_render.layout, &[
             (0, slot.uniforms.bind(constants)),
             (4, view(&self.caustics_rays)),
@@ -1029,6 +1107,16 @@ impl GpuRenderer {
         pass.set_bind_group(0, &triangles, &[]);
         pass.set_bind_group(1, &self.common_samplers, &[]);
         pass.draw(0..128 * 128 * 6, 0..3);
+        drop(pass);
+        diagnostic::checkpoint(
+            self.diagnose_passes,
+            "caustics raster",
+            encoder,
+            &self.device,
+            &self.queue,
+            &slot.uniforms,
+            &self.error,
+        )?;
         Ok(())
     }
 
@@ -1119,6 +1207,9 @@ impl GpuRenderer {
             ];
             cloud_pass(
                 &self.device,
+                &self.queue,
+                self.diagnose_passes,
+                &self.error,
                 encoder,
                 &self.common_samplers,
                 &self.pipelines.cloud_prepare,
@@ -1138,6 +1229,9 @@ impl GpuRenderer {
             uniforms.step[3] = sources.len() as f32;
             cloud_pass(
                 &self.device,
+                &self.queue,
+                self.diagnose_passes,
+                &self.error,
                 encoder,
                 &self.common_samplers,
                 &self.pipelines.cloud_normalize,
@@ -1159,6 +1253,9 @@ impl GpuRenderer {
                     uniforms.dispatch = [0; 4];
                     cloud_pass(
                         &self.device,
+                        &self.queue,
+                        self.diagnose_passes,
+                        &self.error,
                         encoder,
                         &self.common_samplers,
                         &self.pipelines.cloud_velocity,
@@ -1178,6 +1275,9 @@ impl GpuRenderer {
                 uniforms.dispatch = [0; 4];
                 cloud_pass(
                     &self.device,
+                    &self.queue,
+                    self.diagnose_passes,
+                    &self.error,
                     encoder,
                     &self.common_samplers,
                     &self.pipelines.cloud_advect,
@@ -1199,6 +1299,9 @@ impl GpuRenderer {
                 uniforms.dispatch = [range.start as u32, range.start as u32, 0, 0];
                 cloud_pass(
                     &self.device,
+                    &self.queue,
+                    self.diagnose_passes,
+                    &self.error,
                     encoder,
                     &self.common_samplers,
                     &self.pipelines.cloud_prepare,
@@ -1221,6 +1324,9 @@ impl GpuRenderer {
 #[allow(clippy::too_many_arguments)]
 fn cloud_pass(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    diagnose_passes: bool,
+    errors: &Arc<Mutex<Diagnostics>>,
     encoder: &mut wgpu::CommandEncoder,
     common: &wgpu::BindGroup,
     stage: &ComputeStage,
@@ -1246,5 +1352,14 @@ fn cloud_pass(
         (7, view(&slot.water)),
     ]);
     dispatch_timed(encoder, stage, &group, common, grid, start_timer.take());
+    diagnostic::checkpoint(
+        diagnose_passes,
+        stage.name,
+        encoder,
+        device,
+        queue,
+        &slot.uniforms,
+        errors,
+    )?;
     Ok(())
 }

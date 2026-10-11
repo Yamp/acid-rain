@@ -6,6 +6,7 @@ use crate::shaders::{
 };
 
 pub struct ComputeStage {
+    pub name: &'static str,
     pub pipeline: ComputePipeline,
     pub layout: BindGroupLayout,
 }
@@ -109,7 +110,7 @@ fn compute(
     device: &Device,
     common: &BindGroupLayout,
     module: &ShaderModule,
-    name: &str,
+    name: &'static str,
     entries: &[BindGroupLayoutEntry],
 ) -> ComputeStage {
     let layout = layout(device, name, entries);
@@ -126,7 +127,11 @@ fn compute(
         compilation_options: Default::default(),
         cache: None,
     });
-    ComputeStage { pipeline, layout }
+    ComputeStage {
+        name,
+        pipeline,
+        layout,
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn render(

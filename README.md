@@ -142,7 +142,8 @@ uv run --no-project python scripts/pty_smoke.py
 ```
 
 CI compiles and tests on Windows, Linux, Apple Silicon and Intel macOS. GPU contract
-tests also run with a Linux software Vulkan driver. Software-driver checks establish
+tests and renderer captures are required with Linux software Vulkan and Windows WARP
+DirectX 12. Software-driver checks establish
 rendering correctness, not hardware performance. Headless timing reports identify the
 adapter and backend; actual window cadence also depends on the compositor and display.
 

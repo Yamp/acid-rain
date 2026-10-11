@@ -111,6 +111,13 @@ fn headless(o: &Options) -> anyhow::Result<()> {
         backends: o.backend.backends(),
         force_fallback_adapter: o.software,
     }))?;
+    if o.diagnose_gpu_passes {
+        gpu.enable_pass_diagnostics()?;
+        eprintln!(
+            "Diagnostic checkpoints serialize GPU passes; timings are not performance \
+             measurements."
+        );
+    }
     let total_frames = o.warmup + o.frames;
     let mut measured = Vec::with_capacity(o.frames as usize);
     let mut simulation_ms = Vec::with_capacity(o.frames as usize);
@@ -234,7 +241,13 @@ fn headless(o: &Options) -> anyhow::Result<()> {
         "steady_completed_mean_frame_ms": steady_completed_ms / f64::from(o.frames),
         "capture_readback_ms": readback_ms,
         "total_completed_ms_including_warmup_and_readback": completed_ms,
-        "timing_note": "Steady wall time includes simulation, snapshot, render calls and final GPU drain; warm-up is fully drained first. Render-call durations include queue backpressure and exclude simulation. GPU intervals bracket the dependent scene passes through final post-processing and exclude the UI overlay, using actual timestamp queries when available. Completion latency includes queued work and callback service. Capture readback is excluded from steady timing.",
+        "diagnostic_serialization": gpu.pass_diagnostics_enabled(),
+        "performance_timing_valid": !gpu.pass_diagnostics_enabled(),
+        "timing_note": if gpu.pass_diagnostics_enabled() {
+            "DIAGNOSTIC ONLY: each production GPU pass is submitted and waited separately. All timings include forced serialization and must not be used as performance measurements."
+        } else {
+            "Steady wall time includes simulation, snapshot, render calls and final GPU drain; warm-up is fully drained first. Render-call durations include queue backpressure and exclude simulation. GPU intervals bracket the dependent scene passes through final post-processing and exclude the UI overlay, using actual timestamp queries when available. Completion latency includes queued work and callback service. Capture readback is excluded from steady timing."
+        },
         "gpu_timings": timing_records,
         "image": image,
     });

@@ -100,6 +100,7 @@ jobs:
       - name: Check release archive integrity tests
         run: uv run --no-project --python 3.14 python -m unittest discover -s scripts -p test_package_release.py
       - name: Build portable desktop and terminal
+        id: portable-build
         run: cargo build --locked --release --target "${{ matrix.target }}" -p acid-rain -p acid-rain-desktop
       - name: Inspect Windows runtime imports
         if: runner.os == 'Windows'
@@ -132,11 +133,18 @@ jobs:
           ACID_RAIN_SOFTWARE: "1"
         run: |
           vulkaninfo --summary > artifacts/vulkan-adapter.txt 2>&1
-          cargo test --locked --release -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture 2>&1 | tee artifacts/software-vulkan-tests.log
+          cargo test --locked --release -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-vulkan-tests.log
           "target/${{ matrix.target }}/release/acid-rain-desktop" --headless --backend vulkan --software --frames 12 --warmup 2 --size 320x200 --output artifacts/linux-vulkan.png --report artifacts/linux-vulkan.json
           printf '%s\n' 'These software Vulkan results validate rendering and numerical correctness. They are not hardware GPU performance measurements.' > artifacts/SOFTWARE-RENDERING.txt
-      - name: Windows software DirectX 12 rendering
+      - name: Required real shader execution on Windows software DirectX 12
         if: runner.os == 'Windows'
+        env:
+          WGPU_BACKEND: dx12
+          ACID_RAIN_GPU_TESTS: "1"
+          ACID_RAIN_SOFTWARE: "1"
+        run: cargo test --locked --release -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-dx12-tests.log
+      - name: Windows software DirectX 12 rendering
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.portable-build.outcome == 'success' }}
         shell: pwsh
         run: |
           $process = Start-Process -FilePath "target/${{ matrix.target }}/release/acid-rain-desktop.exe" -ArgumentList @('--headless', '--backend', 'dx12', '--software', '--frames', '12', '--warmup', '2', '--size', '320x200', '--output', 'artifacts/windows-warp.png', '--report', 'artifacts/windows-warp.json') -Wait -PassThru -NoNewWindow -RedirectStandardOutput artifacts/windows-warp.stdout.log -RedirectStandardError artifacts/windows-warp.stderr.log
@@ -149,12 +157,13 @@ jobs:
             } else {
               $primaryExitCode = $process.ExitCode
               try {
-                $probe = Start-Process -FilePath "target/${{ matrix.target }}/release/acid-rain-desktop.exe" -ArgumentList @('--headless', '--backend', 'dx12', '--software', '--quality', 'low', '--frames', '12', '--warmup', '2', '--size', '64x40', '--output', 'artifacts/windows-warp-low.png', '--report', 'artifacts/windows-warp-low.json') -Wait -PassThru -NoNewWindow -RedirectStandardOutput artifacts/windows-warp-low.stdout.log -RedirectStandardError artifacts/windows-warp-low.stderr.log
-                Set-Content artifacts/windows-warp-low.exitcode.txt $probe.ExitCode
-                Get-Content artifacts/windows-warp-low.stdout.log, artifacts/windows-warp-low.stderr.log | Set-Content artifacts/windows-warp-low.log
-                Get-Content artifacts/windows-warp-low.log
+                Set-Content artifacts/windows-warp-serialized-NOT-A-BENCHMARK.txt 'This diagnostic serializes and waits after production GPU passes. Its timing does not represent normal rendering performance.'
+                $probe = Start-Process -FilePath "target/${{ matrix.target }}/release/acid-rain-desktop.exe" -ArgumentList @('--headless', '--backend', 'dx12', '--software', '--quality', 'high', '--diagnose-gpu-passes', '--frames', '12', '--warmup', '2', '--size', '320x200', '--output', 'artifacts/windows-warp-serialized.png', '--report', 'artifacts/windows-warp-serialized.json') -Wait -PassThru -NoNewWindow -RedirectStandardOutput artifacts/windows-warp-serialized.stdout.log -RedirectStandardError artifacts/windows-warp-serialized.stderr.log
+                Set-Content artifacts/windows-warp-serialized.exitcode.txt $probe.ExitCode
+                Get-Content artifacts/windows-warp-serialized.stdout.log, artifacts/windows-warp-serialized.stderr.log | Set-Content artifacts/windows-warp-serialized.log
+                Get-Content artifacts/windows-warp-serialized.log
               } catch {
-                $_ | Out-String | Set-Content artifacts/windows-warp-low-launch-error.log
+                $_ | Out-String | Set-Content artifacts/windows-warp-serialized-launch-error.log
               }
               exit $primaryExitCode
             }

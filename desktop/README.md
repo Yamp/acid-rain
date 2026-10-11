@@ -60,10 +60,10 @@ cargo run --locked --release -p acid-rain-desktop -- --headless --frames 120 \
   --warmup 20 --size 1280x800 --output artifacts/desktop.png --report artifacts/desktop.json
 ```
 
-`--software` requests a software adapter. CI requires real shader execution under
-Linux Mesa Vulkan, including numerical GPU tests and a captured frame. Windows WARP
-is attempted as well; unavailable adapters are explicitly marked in the validation
-archive. Software-renderer timings must not be reported as hardware GPU FPS.
+`--software` requests a software adapter. CI requires numerical GPU tests and a
+captured frame under both Linux Mesa Vulkan and Windows WARP DirectX 12. Missing
+software adapters fail the required numerical tests. Software-renderer timings
+must not be reported as hardware GPU FPS.
 
 Every platform runs locked CPU tests and WGSL validation. Tagged releases run the
 same checks before publishing four platform archives, `validation.zip`, and a

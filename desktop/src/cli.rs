@@ -72,6 +72,9 @@ pub struct Options {
     /// Render without opening a window (requires a graphics adapter).
     #[arg(long)]
     pub headless: bool,
+    /// Check each GPU pass synchronously to diagnose a failure; timings are not benchmarks.
+    #[arg(long, requires = "headless")]
+    pub diagnose_gpu_passes: bool,
     /// Number of measured frames after warm-up in headless mode.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=1000000))]
     pub frames: u32,
@@ -205,6 +208,13 @@ impl Options {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pass_diagnostics_require_explicit_headless_mode() {
+        assert!(Options::try_parse_from(["water", "--diagnose-gpu-passes"]).is_err());
+        let options = Options::try_parse_from(["water", "--headless", "--diagnose-gpu-passes"])
+            .expect("headless diagnostic mode must be supported");
+        assert!(options.headless);
+    }
     #[test]
     fn preferred_defaults() {
         let o = Options::try_parse_from(["water"]).unwrap();

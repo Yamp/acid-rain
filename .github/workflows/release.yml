@@ -50,8 +50,8 @@ jobs:
           (root / 'README.txt').write_text(
               'Validation of commit ' + os.environ['GITHUB_SHA'] + '\n'
               'All platform build, CPU test and WGSL validation jobs passed.\n'
-              'Linux Vulkan capture executes the actual GPU pipeline on a software driver.\n'
-              'Windows WARP execution is attempted; an unavailable adapter is explicitly marked SKIPPED.\n'
+              'Numerical GPU tests and full renderer captures are required on Linux software Vulkan and Windows WARP DirectX 12.\n'
+              'Missing software adapters fail the required numerical tests.\n'
               'Software timings are NOT hardware GPU FPS claims.\n'
               'Workflow: https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '\n')
           archive = pathlib.Path(shutil.make_archive('dist/validation', 'zip', root))

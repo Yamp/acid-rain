@@ -48,6 +48,36 @@ pub fn init_diagnostics_logging() {
     }
 }
 
+pub fn check(
+    device: &wgpu::Device,
+    diagnostics: &std::sync::Mutex<Diagnostics>,
+) -> anyhow::Result<()> {
+    // Release our callback-state lock before touching the backend. Querying
+    // outside a callback also avoids reentering wgpu's device-lost machinery.
+    let message = diagnostics.lock().unwrap().fatal().map(str::to_owned);
+    if let Some(message) = message {
+        #[cfg(target_os = "windows")]
+        {
+            // SAFETY: only reads an HRESULT through the live guarded device;
+            // no native resources are created, destroyed, or mutated.
+            if let Some(raw) = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() } {
+                let reason = unsafe { raw.raw_device().GetDeviceRemovedReason() };
+                match reason {
+                    Ok(()) => anyhow::bail!("{message}; DX12 GetDeviceRemovedReason: S_OK"),
+                    Err(reason) => anyhow::bail!(
+                        "{message}; DX12 GetDeviceRemovedReason: 0x{:08X} ({reason})",
+                        reason.code().0 as u32
+                    ),
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = device;
+        anyhow::bail!("{message}");
+    }
+    Ok(())
+}
+
 impl Diagnostics {
     pub fn record(
         &mut self,
