@@ -110,6 +110,7 @@ fn headless(o: &Options) -> anyhow::Result<()> {
         height: o.size[1],
         backends: o.backend.backends(),
         force_fallback_adapter: o.software,
+        timestamp_queries: !o.no_gpu_timestamps,
     }))?;
     if o.diagnose_gpu_passes {
         gpu.enable_pass_diagnostics()?;
@@ -233,6 +234,7 @@ fn headless(o: &Options) -> anyhow::Result<()> {
         "render_call_mean_ms": mean, "render_call_p95_ms": p95,
         "simulation_and_snapshot_mean_ms": simulation_stats.0, "simulation_and_snapshot_p95_ms": simulation_stats.1,
         "timestamp_queries": gpu.timestamp_queries, "gpu_timed_frames": gpu_ms.len(),
+        "timestamp_queries_requested": !o.no_gpu_timestamps,
         "gpu_mean_ms": gpu_stats.map(|stats| stats.0), "gpu_p95_ms": gpu_stats.map(|stats| stats.1),
         "submit_to_completion_mean_ms": completion_stats.map(|stats| stats.0),
         "submit_to_completion_p95_ms": completion_stats.map(|stats| stats.1),

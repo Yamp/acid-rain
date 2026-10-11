@@ -387,6 +387,7 @@ impl ApplicationHandler<UserEvent> for App {
                     height: size.height.max(1),
                     backends: self.options.backend.backends(),
                     force_fallback_adapter: self.options.software,
+                    timestamp_queries: !self.options.no_gpu_timestamps,
                 }))?;
                 let ctx = egui::Context::default();
                 ui::configure(&ctx);

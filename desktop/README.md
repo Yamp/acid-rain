@@ -65,6 +65,9 @@ captured frame under both Linux Mesa Vulkan and Windows WARP DirectX 12. Missing
 software adapters fail the required numerical tests. Software-renderer timings
 must not be reported as hardware GPU FPS.
 
+`--no-gpu-timestamps` preserves the visual rendering graph, uses queue completion
+for automatic quality control, and reports GPU intervals as `null`.
+
 Every platform runs locked CPU tests and WGSL validation. Tagged releases run the
 same checks before publishing four platform archives, `validation.zip`, and a
 top-level `SHA256SUMS`. The workflow rejects mismatched package versions and verifies

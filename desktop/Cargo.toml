@@ -29,3 +29,6 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Syst
 
 [dev-dependencies]
 naga = { version = "=27.0.3", features = ["wgsl-in", "hlsl-out"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "=0.58.0", features = ["Win32_Graphics_Direct3D12"] }

@@ -71,6 +71,8 @@ pub struct GpuConfig {
     pub height: u32,
     pub backends: wgpu::Backends,
     pub force_fallback_adapter: bool,
+    /// Explicit compatibility/diagnostic switch; does not change the render graph.
+    pub timestamp_queries: bool,
 }
 impl Default for GpuConfig {
     fn default() -> Self {
@@ -79,6 +81,7 @@ impl Default for GpuConfig {
             height: 800,
             backends: wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::METAL,
             force_fallback_adapter: false,
+            timestamp_queries: true,
         }
     }
 }
@@ -304,7 +307,8 @@ impl GpuRenderer {
             "Adapter {} does not support HDR additive caustic blending",
             adapter_info.name
         );
-        let timestamp_queries = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let timestamp_queries = config.timestamp_queries
+            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let mut required_features = if hardware_filtering {
             wgpu::Features::FLOAT32_FILTERABLE
         } else {

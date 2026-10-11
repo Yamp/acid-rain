@@ -75,6 +75,9 @@ pub struct Options {
     /// Check each GPU pass synchronously to diagnose a failure; timings are not benchmarks.
     #[arg(long, requires = "headless")]
     pub diagnose_gpu_passes: bool,
+    /// Use queue-completion latency instead of optional GPU timestamp queries.
+    #[arg(long)]
+    pub no_gpu_timestamps: bool,
     /// Number of measured frames after warm-up in headless mode.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=1000000))]
     pub frames: u32,
@@ -317,6 +320,21 @@ mod tests {
                 Options::try_parse_from(["water", "--size", size]).is_err(),
                 "{size}"
             );
+        }
+    }
+    #[test]
+    fn timestamp_query_bypass_is_available_for_window_and_capture() {
+        assert!(
+            !Options::try_parse_from(["water"])
+                .unwrap()
+                .no_gpu_timestamps
+        );
+        for args in [vec!["water", "--no-gpu-timestamps"], vec![
+            "water",
+            "--headless",
+            "--no-gpu-timestamps",
+        ]] {
+            assert!(Options::try_parse_from(args).unwrap().no_gpu_timestamps);
         }
     }
 }

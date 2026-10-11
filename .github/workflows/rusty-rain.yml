@@ -5,6 +5,12 @@ on:
     branches: ["**"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      windows-probe:
+        description: Run only the Windows timestamp diagnostic; cannot produce release archives.
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       release-version:
@@ -28,6 +34,7 @@ env:
 
 jobs:
   validate:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.windows-probe }}
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -223,5 +230,118 @@ jobs:
           path: |
             target/x86_64-pc-windows-msvc/release/acid-rain.exe
             target/x86_64-pc-windows-msvc/release/acid-rain-desktop.exe
+          if-no-files-found: warn
+          retention-days: 14
+  windows-probe:
+    name: Windows GPU profiling probe
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows-probe }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add x86_64-pc-windows-msvc --toolchain stable
+          rustc --version
+          cargo --version
+          mkdir -p artifacts
+      - name: Reuse portable Windows validation dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Match the regular Windows validate job's prefix, including its job ID.
+          shared-key: x86_64-pc-windows-msvc-release-portable-v1-validate
+          workspaces: . -> target
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET ACID_RAIN_PORTABLE
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-on-failure: true
+      - name: Record diagnostic source provenance
+        shell: pwsh
+        run: |
+          @{
+            repository = $env:GITHUB_REPOSITORY
+            commit = $env:GITHUB_SHA
+            checked_out_commit = (& git rev-parse HEAD)
+            run_id = $env:GITHUB_RUN_ID
+            workflow = $env:GITHUB_WORKFLOW
+            ref = $env:GITHUB_REF
+            release_eligible = $false
+          } | ConvertTo-Json | Set-Content artifacts/probe-source.json
+          Set-Content artifacts/NOT-A-RELEASE.txt 'Windows-only diagnostic. This run does not validate all platforms and cannot supply release archives. Software-driver timings are not hardware GPU performance measurements.'
+      - name: Check locked desktop before compilation
+        run: cargo check --locked -p acid-rain-desktop --all-targets --target x86_64-pc-windows-msvc
+      - name: Build portable desktop
+        run: cargo build --locked --release -p acid-rain-desktop --target x86_64-pc-windows-msvc
+      - name: Run independent timestamp and full-scene probes
+        shell: pwsh
+        env:
+          WGPU_BACKEND: dx12
+          ACID_RAIN_GPU_TESTS: "1"
+          ACID_RAIN_SOFTWARE: "1"
+        run: |
+          function Invoke-Probe([string]$Name, [string]$Program, [string[]]$Arguments, [int]$TimeoutSeconds = 180) {
+            $stdout = "artifacts/$Name.stdout.log"
+            $stderr = "artifacts/$Name.stderr.log"
+            try {
+              $process = Start-Process -FilePath $Program -ArgumentList $Arguments -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+              if (!$process.WaitForExit($TimeoutSeconds * 1000)) {
+                $process.Kill($true)
+                $process.WaitForExit()
+                Set-Content "artifacts/$Name.timeout.txt" "Process tree terminated after $TimeoutSeconds seconds."
+                Set-Content "artifacts/$Name.exitcode.txt" 124
+                Get-Content $stdout, $stderr | Set-Content "artifacts/$Name.log"
+                return 124
+              }
+              $process.WaitForExit()
+              Get-Content $stdout, $stderr | Set-Content "artifacts/$Name.log"
+              Get-Content "artifacts/$Name.log" | Write-Host
+              Set-Content "artifacts/$Name.exitcode.txt" $process.ExitCode
+              return [int]$process.ExitCode
+            } catch {
+              $_ | Out-String | Set-Content "artifacts/$Name.launch-error.log"
+              Set-Content "artifacts/$Name.exitcode.txt" 1
+              return 1
+            }
+          }
+          $results = @{}
+          $results.timestamp_fixture = Invoke-Probe -Name 'timestamp-fixture' -Program 'cargo.exe' -TimeoutSeconds 600 -Arguments @('test', '--release', '--locked', '-p', 'acid-rain-desktop', '--target', 'x86_64-pc-windows-msvc', '--lib', 'timestamp_query_spans', '--', '--nocapture', '--test-threads=1')
+          if ($results.timestamp_fixture -eq 0 -and !(Select-String -Path artifacts/timestamp-fixture.log -SimpleMatch 'test result: ok. 2 passed;' -Quiet)) {
+            $results.timestamp_fixture = 1
+            Set-Content artifacts/timestamp-fixture.missing-tests.txt 'The expected two timestamp tests did not both execute successfully.'
+          }
+          foreach ($marker in @('Timestamp fixture PASS serialized=false', 'Timestamp fixture PASS serialized=true')) {
+            if ($results.timestamp_fixture -eq 0 -and !(Select-String -Path artifacts/timestamp-fixture.log -SimpleMatch $marker -Quiet)) {
+              $results.timestamp_fixture = 1
+              Set-Content artifacts/timestamp-fixture.missing-execution.txt "A required query fixture did not execute: $marker"
+            }
+          }
+          $binary = 'target/x86_64-pc-windows-msvc/release/acid-rain-desktop.exe'
+          $common = @('--headless', '--backend', 'dx12', '--software', '--quality', 'high', '--frames', '12', '--warmup', '2', '--size', '320x200')
+          $results.normal_capture = Invoke-Probe -Name 'normal-capture' -Program $binary -Arguments ($common + @('--output', 'artifacts/normal-capture.png', '--report', 'artifacts/normal-capture.json'))
+          $results.no_timestamps_capture = Invoke-Probe -Name 'no-timestamps-capture' -Program $binary -Arguments ($common + @('--no-gpu-timestamps', '--output', 'artifacts/no-timestamps-capture.png', '--report', 'artifacts/no-timestamps-capture.json'))
+          foreach ($capture in @(@('normal_capture', 'normal-capture'), @('no_timestamps_capture', 'no-timestamps-capture'))) {
+            if ($results[$capture[0]] -eq 0 -and (!(Test-Path "artifacts/$($capture[1]).png" -PathType Leaf) -or !(Test-Path "artifacts/$($capture[1]).json" -PathType Leaf))) {
+              $results[$capture[0]] = 1
+              Set-Content "artifacts/$($capture[1]).missing-output.txt" 'Successful process exit did not produce both capture files.'
+            }
+          }
+          $results | ConvertTo-Json | Set-Content artifacts/probe-results.json
+          if (@($results.Values | Where-Object { $_ -ne 0 }).Count -gt 0) {
+            throw 'One or more diagnostic probes failed; all available independent results were retained.'
+          }
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-gpu-probe
+          path: artifacts/
           if-no-files-found: warn
           retention-days: 14
