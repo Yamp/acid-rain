@@ -150,7 +150,7 @@ jobs:
           ACID_RAIN_SOFTWARE: "1"
         run: |
           vulkaninfo --summary > artifacts/vulkan-adapter.txt 2>&1
-          cargo test --locked --release -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-vulkan-tests.log
+          cargo test --locked --release --no-fail-fast -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-vulkan-tests.log
           "target/${{ matrix.target }}/release/acid-rain-desktop" --headless --backend vulkan --software --frames 12 --warmup 2 --size 320x200 --output artifacts/linux-vulkan.png --report artifacts/linux-vulkan.json
           printf '%s\n' 'These software Vulkan results validate rendering and numerical correctness. They are not hardware GPU performance measurements.' > artifacts/SOFTWARE-RENDERING.txt
       - name: Required real shader execution on Windows software DirectX 12
@@ -159,7 +159,7 @@ jobs:
           WGPU_BACKEND: dx12
           ACID_RAIN_GPU_TESTS: "1"
           ACID_RAIN_SOFTWARE: "1"
-        run: cargo test --locked --release -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-dx12-tests.log
+        run: cargo test --locked --release --no-fail-fast -p acid-rain-desktop --target "${{ matrix.target }}" -- --nocapture --test-threads=1 2>&1 | tee artifacts/software-dx12-tests.log
       - name: Windows software DirectX 12 rendering
         if: ${{ !cancelled() && runner.os == 'Windows' && steps.portable-build.outcome == 'success' }}
         shell: pwsh

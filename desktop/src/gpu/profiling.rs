@@ -216,7 +216,8 @@ mod tests {
         });
         let slot = TimingSlot::new(&device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Tiny timestamp fixture: compute then render"),
+            // DXC receives this label as a source filename, including in debug mode.
+            label: Some("timestamp_compute_vertex.hlsl"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
                 r#"
                 @group(0) @binding(0) var<storage, read_write> result: u32;
