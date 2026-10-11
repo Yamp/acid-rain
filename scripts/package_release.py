@@ -130,10 +130,10 @@ def package(args: argparse.Namespace) -> Path:
         notices.mkdir(parents=True)
         for source, destination in VENDOR_NOTICES.items():
             if destination == "README.md":
-                text(notices / destination,
-                     "This archive includes notices, provenance and the patch. The complete patched source is "
-                     f"[available with this release](https://github.com/Yamp/acid-rain/tree/v{version}/vendor/wgpu-core). "
-                     "The original source-package documentation follows.\n\n" + (repo / source).read_text(encoding="utf-8"))
+                preface = ("This archive includes notices, provenance and the patch. The complete patched source is "
+                           f"[available with this release](https://github.com/Yamp/acid-rain/tree/v{version}/vendor/wgpu-core). "
+                           "The original source-package documentation follows.\n\n")
+                (notices / destination).write_bytes(preface.encode("utf-8") + (repo / source).read_bytes())
             else:
                 shutil.copyfile(repo / source, notices / destination)
         for source, destination in [("README.md", "README.md"), ("desktop/README.md", "DESKTOP.md")]:

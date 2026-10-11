@@ -143,6 +143,8 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertNotEqual(self.run_script("manifest", "--directory", str(self.out)).returncode, 0)
 
     def test_vendor_notices_are_required_preserved_and_checksummed(self):
+        readme = self.repo / "vendor/README.md"
+        readme.write_bytes(readme.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
         license = self.repo / "vendor/wgpu-core/LICENSE.MIT"
         license_bytes = license.read_bytes()
         license.unlink()
