@@ -11,7 +11,8 @@ or macOS Intel (x86-64). Each archive includes the desktop and terminal executab
 launchers, documentation, license and SHA-256 checksums. A Rust installation is not
 required. GPU shaders are embedded in the desktop executable.
 
-- Windows: extract the ZIP and open `Start Desktop.cmd` or `acid-rain-desktop.exe`.
+- Windows: extract the ZIP and double-click `acid-rain-desktop.exe`. The optional
+  `Start Desktop.cmd` helper starts the graphical app and closes its command window.
 - Linux: extract the tarball and run `./start-desktop.sh` inside the extracted directory.
 - macOS: open `Acid Rain Desktop.app`. The Apple Silicon archive also includes the
   original `Acid Rain Metal.app`. Applications are ad-hoc signed, not notarized.

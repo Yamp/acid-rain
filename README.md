@@ -6,6 +6,8 @@ underwater world while currents carry ripples and pigment in another direction.
 **[Download the latest release](https://github.com/Yamp/acid-rain/releases/latest)** ·
 [Desktop guide](desktop/README.md) · [macOS Metal edition](native/README.md)
 
+![The desktop renderer: drifting violet and cyan water, pigment and refracted light](docs/images/desktop.png)
+
 ## Choose an edition
 
 | Edition | Platforms | Rendering |

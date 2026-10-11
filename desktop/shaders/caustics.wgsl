@@ -95,7 +95,10 @@ fn causticsFragment(fragmentInput: CausticsVertexOut) -> @location(0) vec4f {
         + 2.0 * fragmentInput.inverseCovariance.y * delta.x * delta.y
         + fragmentInput.inverseCovariance.z * delta.y * delta.y;
     if q > 9.0 { discard; }
-    var result = vec4f(0.0);
-    result[fragmentInput.channel] = fragmentInput.amplitude * exp(-0.5 * q);
-    return result;
+    let irradiance = fragmentInput.amplitude * exp(-0.5 * q);
+    // FXC cannot assign a dynamically indexed vector component. The three
+    // instances carry R/G/B flux; construct the same one-channel value directly.
+    return vec4f(select(0.0, irradiance, fragmentInput.channel == 0u),
+                 select(0.0, irradiance, fragmentInput.channel == 1u),
+                 select(0.0, irradiance, fragmentInput.channel == 2u), 0.0);
 }

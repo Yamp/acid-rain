@@ -66,6 +66,16 @@ jobs:
           rustc --version
           cargo --version
           mkdir -p artifacts
+      - name: Cache portable Rust dependencies by target and release profile
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}-release-portable-v1
+          workspaces: . -> target
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET ACID_RAIN_PORTABLE
+          cache-bin: false
+          cache-workspace-crates: false
+          cache-on-failure: false
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install Linux window-system and software Vulkan dependencies
         if: runner.os == 'Linux'
         run: |
@@ -103,21 +113,22 @@ jobs:
           printf '%s\n' 'These software Vulkan results validate rendering and numerical correctness. They are not hardware GPU performance measurements.' > artifacts/SOFTWARE-RENDERING.txt
       - name: Windows software DirectX 12 rendering
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          set +e
-          "target/${{ matrix.target }}/release/acid-rain-desktop.exe" --headless --backend dx12 --software --frames 12 --warmup 2 --size 320x200 --output artifacts/windows-warp.png --report artifacts/windows-warp.json > artifacts/windows-warp.log 2>&1
-          result=$?
-          set -e
-          cat artifacts/windows-warp.log
-          if [[ "$result" != 0 ]]; then
-            if grep -Fq 'No compatible graphics adapter:' artifacts/windows-warp.log; then
-              printf '%s\n' 'SKIPPED: the hosted runner exposes no compatible software DX12 adapter.' > artifacts/windows-warp-SKIPPED.txt
-              echo '::warning::WARP adapter unavailable; Windows GPU execution was not verified. See validation evidence.'
-            else
-              exit "$result"
-            fi
-          fi
-          printf '%s\n' 'Windows WARP is a software renderer. These results validate execution, not hardware GPU FPS.' > artifacts/SOFTWARE-RENDERING.txt
+          $process = Start-Process -FilePath "target/${{ matrix.target }}/release/acid-rain-desktop.exe" -ArgumentList @('--headless', '--backend', 'dx12', '--software', '--frames', '12', '--warmup', '2', '--size', '320x200', '--output', 'artifacts/windows-warp.png', '--report', 'artifacts/windows-warp.json') -Wait -PassThru -NoNewWindow -RedirectStandardOutput artifacts/windows-warp.stdout.log -RedirectStandardError artifacts/windows-warp.stderr.log
+          Get-Content artifacts/windows-warp.stdout.log, artifacts/windows-warp.stderr.log | Set-Content artifacts/windows-warp.log
+          Get-Content artifacts/windows-warp.log
+          if ($process.ExitCode -ne 0) {
+            if (Select-String -Path artifacts/windows-warp.log -SimpleMatch 'No compatible graphics adapter:' -Quiet) {
+              Set-Content artifacts/windows-warp-SKIPPED.txt 'SKIPPED: the hosted runner exposes no compatible software DX12 adapter.'
+              Write-Output '::warning::WARP adapter unavailable; Windows GPU execution was not verified. See validation evidence.'
+            } else {
+              exit $process.ExitCode
+            }
+          } elseif (!(Test-Path artifacts/windows-warp.png -PathType Leaf) -or !(Test-Path artifacts/windows-warp.json -PathType Leaf)) {
+            throw 'The headless GUI process exited successfully without its PNG and JSON capture.'
+          }
+          Set-Content artifacts/SOFTWARE-RENDERING.txt 'Windows WARP is a software renderer. These results validate execution, not hardware GPU FPS.'
       - name: Build original native Metal app on Apple Silicon
         if: matrix.target == 'aarch64-apple-darwin'
         run: ./native/build.sh 2>&1 | tee artifacts/native-build.log

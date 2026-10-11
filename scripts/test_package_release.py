@@ -65,6 +65,28 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn(name, contents)
         self.assertIn(b'%~dp0', contents["Start Desktop.cmd"])
 
+    def test_packaged_readme_resolves_source_links_at_release_tag(self):
+        (self.repo / "docs/images").mkdir(parents=True)
+        (self.repo / "native").mkdir()
+        (self.repo / "native/README.md").write_text("Native guide")
+        (self.repo / "docs/images/desktop.png").write_bytes(b"image fixture")
+        source = ('[Desktop](desktop/README.md) [Metal](native/README.md#launch)\n'
+                  '![GPU image](docs/images/desktop.png)\n'
+                  '[External](https://example.com/guide) [Here](#controls)\n'
+                  '```md\n[example](not-a-real-file.md)\n```\n')
+        (self.repo / "README.md").write_text(source)
+        result = self.package("x86_64-pc-windows-msvc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with zipfile.ZipFile(next(self.out.glob("*.zip"))) as archive:
+            name = next(name for name in archive.namelist() if name.endswith("/README.md"))
+            readme = archive.read(name).decode()
+        self.assertIn('[Desktop](https://github.com/Yamp/acid-rain/blob/v0.2.0/desktop/README.md)', readme)
+        self.assertIn('[Metal](https://github.com/Yamp/acid-rain/blob/v0.2.0/native/README.md#launch)', readme)
+        self.assertIn('![GPU image](https://raw.githubusercontent.com/Yamp/acid-rain/v0.2.0/docs/images/desktop.png)', readme)
+        self.assertIn('[External](https://example.com/guide) [Here](#controls)', readme)
+        self.assertIn('```md\n[example](not-a-real-file.md)\n```', readme)
+        self.assertEqual((self.repo / "README.md").read_text(), source)
+
     def test_missing_binary_and_unsafe_version_fail_without_archive(self):
         (self.bin / "acid-rain-desktop").unlink()
         self.assertNotEqual(self.package("x86_64-unknown-linux-gnu").returncode, 0)

@@ -138,8 +138,10 @@ pub fn mode_name(mode: u32) -> &'static str {
 }
 
 pub fn configure(ctx: &egui::Context) {
+    ctx.set_theme(egui::ThemePreference::Dark);
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
+    style.visuals.override_text_color = Some(Color32::from_rgb(228, 222, 240));
     style.visuals.window_fill = Color32::from_rgba_unmultiplied(13, 15, 28, 232);
     style.visuals.panel_fill = Color32::from_rgba_unmultiplied(13, 15, 28, 198);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(96, 65, 145);
@@ -326,6 +328,26 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operating_system_light_theme_cannot_override_the_dark_overlay() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        for theme in [egui::Theme::Light, egui::Theme::Dark, egui::Theme::Light] {
+            let input = egui::RawInput {
+                system_theme: Some(theme),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                assert_eq!(ctx.theme(), egui::Theme::Dark);
+                assert!(ctx.style().visuals.dark_mode);
+                assert_eq!(
+                    ctx.style().visuals.window_fill,
+                    Color32::from_rgba_unmultiplied(13, 15, 28, 232)
+                );
+                assert!(ctx.style().visuals.text_color().r() >= 150);
+            });
+        }
+    }
     #[test]
     fn physical_keys_and_shift_resets() {
         assert_eq!(

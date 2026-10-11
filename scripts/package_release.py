@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 TARGETS = {
     "x86_64-unknown-linux-gnu": "linux-x86_64",
@@ -39,6 +40,49 @@ def copy_executable(source: Path, destination: Path) -> None:
     destination.chmod(0o755)
 
 
+def release_markdown(repo: Path, source: Path, version: str) -> str:
+    """Keep archive documentation self-contained without copying source trees.
+
+    Source-relative links point at the matching Git tag; images use raw URLs.
+    Absolute links, local anchors, inline code and fenced examples are unchanged.
+    """
+    links = re.compile(r'(?P<label>!?\[[^\]\n]*\])\((?P<target><[^>\n]+>|[^\s()]+)(?P<title>\s+"[^"\n]*")?\)')
+    def replace(match: re.Match) -> str:
+        original = match["target"]
+        target = original.removeprefix("<").removesuffix(">")
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc or not parsed.path:
+            return match[0]
+        resolved = (source.parent / unquote(parsed.path)).resolve()
+        if not resolved.is_relative_to(repo) or not resolved.exists():
+            raise ValueError(f"Documentation link leaves the repository or is missing: {source}: {target}")
+        path = quote(resolved.relative_to(repo).as_posix(), safe="/")
+        if match["label"].startswith("!"):
+            absolute = f"https://raw.githubusercontent.com/Yamp/acid-rain/v{version}/{path}"
+        else:
+            kind = "tree" if resolved.is_dir() else "blob"
+            absolute = f"https://github.com/Yamp/acid-rain/{kind}/v{version}/{path}"
+        destination = urlunsplit((*urlsplit(absolute)[:3], parsed.query, parsed.fragment))
+        return f'{match["label"]}({destination}{match["title"] or ""})'
+    output, fence = [], None
+    for line in source.read_text(encoding="utf-8").splitlines(keepends=True):
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if marker:
+            token = marker[1]
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence):
+                fence = None
+            output.append(line)
+        elif fence is not None:
+            output.append(line)
+        else:
+            parts = re.split(r"(`+[^`]*`+)", line)
+            output.append("".join(part if index % 2 else links.sub(replace, part)
+                                  for index, part in enumerate(parts)))
+    return "".join(output)
+
+
 def package(args: argparse.Namespace) -> Path:
     version = args.version.removeprefix("v")
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
@@ -59,11 +103,13 @@ def package(args: argparse.Namespace) -> Path:
         stage.mkdir()
         for binary in ["acid-rain", "acid-rain-desktop"]:
             copy_executable(binaries / (binary + suffix), stage / (binary + suffix))
-        for source, destination in [("LICENSE", "LICENSE"), ("README.md", "README.md"), ("desktop/README.md", "DESKTOP.md")]:
-            shutil.copyfile(repo / source, stage / destination)
+        shutil.copyfile(repo / "LICENSE", stage / "LICENSE")
+        for source, destination in [("README.md", "README.md"), ("desktop/README.md", "DESKTOP.md")]:
+            text(stage / destination, release_markdown(repo, repo / source, version))
         if windows:
             for label, binary in [("Desktop", "acid-rain-desktop"), ("Terminal", "acid-rain")]:
-                text(stage / f"Start {label}.cmd", f'@echo off\r\ncd /d "%~dp0"\r\n"%~dp0{binary}.exe" %*\r\n')
+                launch = 'start "" ' if label == "Desktop" else ""
+                text(stage / f"Start {label}.cmd", f'@echo off\r\ncd /d "%~dp0"\r\n{launch}"%~dp0{binary}.exe" %*\r\n')
         else:
             for label, binary in [("desktop", "acid-rain-desktop"), ("terminal", "acid-rain")]:
                 text(stage / f"start-{label}.sh", '#!/bin/sh\nset -eu\ncd -- "$(dirname -- "$0")"\n'
@@ -90,7 +136,7 @@ def package(args: argparse.Namespace) -> Path:
 
 Graphical water: acid-rain-desktop{suffix}
 Terminal edition: acid-rain{suffix}
-Windows: double-click Start Desktop.cmd. Linux: run ./start-desktop.sh.
+Windows: double-click acid-rain-desktop.exe. Linux: run ./start-desktop.sh.
 macOS: open Acid Rain Desktop.app; the optional Acid Rain Metal.app is the original native edition.
 
 Press h in the graphical app for controls. Command-line options: acid-rain-desktop{suffix} --help

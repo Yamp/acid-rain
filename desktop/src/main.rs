@@ -1,4 +1,5 @@
 #![recursion_limit = "256"]
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 mod app;
 mod cli;
 mod ui;
@@ -20,11 +21,79 @@ use clap::Parser;
 use cli::Options;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    windows_launch::attach_existing_console();
     let options = Options::parse();
-    if options.headless {
+    #[cfg(target_os = "windows")]
+    let interactive = !options.headless;
+    let result = if options.headless {
         headless(&options)
     } else {
         app::run(options)
+    };
+    #[cfg(target_os = "windows")]
+    if interactive && let Err(error) = &result {
+        windows_launch::show_error(error);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+mod windows_launch {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{
+            ATTACH_PARENT_PROCESS,
+            AttachConsole,
+            GetStdHandle,
+            STD_ERROR_HANDLE,
+            STD_OUTPUT_HANDLE,
+        },
+        UI::WindowsAndMessaging::{
+            MB_ICONERROR,
+            MB_OK,
+            MessageBoxW,
+        },
+    };
+
+    pub fn attach_existing_console() {
+        // A GUI-subsystem executable does not allocate a blank terminal on
+        // double-click. Shells/CI may already supply redirected pipes or files:
+        // leave either inherited output handle untouched. Otherwise attach the
+        // parent's existing console so --help and headless output remain useful.
+        // Explorer has no console, in which case AttachConsole simply fails.
+        unsafe {
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            let stderr = GetStdHandle(STD_ERROR_HANDLE);
+            let valid = |handle: windows_sys::Win32::Foundation::HANDLE| {
+                !handle.is_null() && handle != INVALID_HANDLE_VALUE
+            };
+            if !valid(stdout) && !valid(stderr) {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+    }
+
+    pub fn show_error(error: &anyhow::Error) {
+        let title: Vec<u16> = "Acid Rain".encode_utf16().chain(Some(0)).collect();
+        let message: Vec<u16> = format!(
+            "Acid Rain could not continue.\n\n{error:#}\n\nUse --help from a terminal to see \
+             launch options."
+        )
+        .replace('\0', " ")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+        // Both UTF-16 strings are NUL-terminated and live through this synchronous
+        // call. Headless/CI failures never display a modal dialog.
+        unsafe {
+            let _ = MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }
 fn create_parent(path: &Path) -> anyhow::Result<()> {
