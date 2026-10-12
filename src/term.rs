@@ -1459,10 +1459,14 @@ mod sampling_tests {
     }
 
     #[test]
-    fn unresolved_normals_and_larger_pixels_broaden_specular_highlights() {
+    fn normal_gradient_variance_and_larger_pixels_broaden_specular_highlights() {
         let smooth = filtered_roughness_squared([0.0, 0.0, 1.0, 0.0], 1.0);
-        let unresolved = filtered_roughness_squared([0.0, 0.0, 0.7, 0.0], 1.0);
-        assert!(unresolved > smooth * 2.0);
+        // Bilinear reconstruction length is not unresolved angular variance.
+        // Counting it again makes roughness oscillate between lattice nodes.
+        assert_eq!(
+            filtered_roughness_squared([0.0, 0.0, 0.7, 0.0], 1.0),
+            smooth
+        );
         let detailed = [0.0, 0.0, 1.0, 0.02];
         assert!(
             filtered_roughness_squared(detailed, 4.0) > filtered_roughness_squared(detailed, 1.0)
@@ -1861,12 +1865,10 @@ fn filtered_roughness_squared(
     normal: [f32; 4],
     footprint: f32,
 ) -> f32 {
-    // Bilinear averaging shortens disagreeing normals. Preserve that lost length
-    // as unresolved variance rather than renormalizing it into a sparkling mirror.
-    let length_squared = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
-    let unresolved = (1.0 - length_squared).max(0.0);
-    let variance = normal[3] + unresolved;
-    (GGX_ROUGHNESS * GGX_ROUGHNESS + variance * footprint.max(1.0).powi(2) * NDF_FILTER_K).min(1.0)
+    // The stored variance comes from the complete unit-normal gradient. The
+    // length lost while interpolating its direction is a reconstruction phase,
+    // not a second physical roughness contribution.
+    (GGX_ROUGHNESS * GGX_ROUGHNESS + normal[3] * footprint.max(1.0).powi(2) * NDF_FILTER_K).min(1.0)
 }
 
 #[inline(always)]
@@ -3245,12 +3247,32 @@ fn precompute_normals(
                 let ddy = (bl * 3.0 + bm * 10.0 + br * 3.0 - tl * 3.0 - tm * 10.0 - tr * 3.0)
                     * (1.0 / 16.0)
                     * y_strength;
-                // Slope is orientation, not roughness. Only variation in neighboring
-                // normals broadens a highlight; a perfectly tilted plane stays glossy.
-                let curvature_x = (mr + ml - 2.0 * center) * x_strength;
-                let curvature_y = (bm + tm - 2.0 * center) * y_strength;
-                let variance = (curvature_x * curvature_x + curvature_y * curvature_y) * 0.25;
                 let il = 1.0 / (ddx * ddx + ddy * ddy + 1.0).sqrt();
+                // Full metric Hessian, including the mixed curvature of a saddle.
+                // Project its columns onto the unit-normal tangent plane before
+                // measuring angular variance: a steep planar slope stays glossy.
+                let hxx = if x > 0 && x + 1 < gw {
+                    (mr + ml - 2.0 * center) * (gw as f32 / PATCH_LENGTH).powi(2)
+                } else {
+                    0.0
+                };
+                let hyy = if y > 0 && y + 1 < gh {
+                    (bm + tm - 2.0 * center) * (gh as f32 / PATCH_LENGTH).powi(2)
+                } else {
+                    0.0
+                };
+                let hxy = (br - bl - tr + tl) * x_strength * y_strength;
+                let tangent_x = ddx * hxx + ddy * hxy;
+                let tangent_y = ddx * hxy + ddy * hyy;
+                let gradient_squared = ((hxx * hxx + 2.0 * hxy * hxy + hyy * hyy)
+                    - (tangent_x * tangent_x + tangent_y * tangent_y) * il * il)
+                    .max(0.0)
+                    * il
+                    * il;
+                // A square reference footprint keeps this scalar rotationally
+                // invariant on rectangular grids too. A box has variance s²/12.
+                let cell = PATCH_LENGTH / gw.min(gh).max(1) as f32;
+                let variance = gradient_squared * cell * cell / 12.0;
                 *out.get_unchecked_mut(x * gh + y) = [-ddx * il, -ddy * il, il, variance];
             }
         }
@@ -3887,6 +3909,78 @@ fn sample_hdr(
     r
 }
 
+#[inline(always)]
+fn bloom_index(
+    index: isize,
+    length: usize,
+) -> usize {
+    if index >= 0 && (index as usize) < length {
+        return index as usize;
+    }
+    let folded = index.rem_euclid((length * 2) as isize) as usize;
+    if folded < length {
+        folded
+    } else {
+        length * 2 - 1 - folded
+    }
+}
+
+#[inline(always)]
+fn sample_bloom(
+    pixels: &[[f32; 3]],
+    width: usize,
+    height: usize,
+    u: f32,
+    v: f32,
+    full_size: (usize, usize),
+    destination: (usize, usize),
+) -> [f32; 3] {
+    // Reflection at pixel-cell boundaries makes symmetric kernels conserve
+    // finite-image energy. Clamping replicated a bright edge over long wings.
+    let mirror = |coordinate: f32| {
+        if (0.0..=1.0).contains(&coordinate) {
+            coordinate
+        } else {
+            let folded = coordinate.rem_euclid(2.0);
+            if folded <= 1.0 { folded } else { 2.0 - folded }
+        }
+    };
+    let (u, v) = (mirror(u), mirror(v));
+    let (full_width, full_height) = full_size;
+    if full_width.is_multiple_of(2) && full_height.is_multiple_of(2) {
+        return sample_hdr(pixels, width, height, u, v);
+    }
+    let area =
+        |x: usize, y: usize| ((full_width - x * 2).min(2) * (full_height - y * 2).min(2)) as f32;
+    let destination_area = area(destination.0, destination.1);
+    let minimum_area = (if full_width.is_multiple_of(2) { 2 } else { 1 }
+        * if full_height.is_multiple_of(2) { 2 } else { 1 }) as f32;
+    if destination_area <= minimum_area {
+        return sample_hdr(pixels, width, height, u, v);
+    }
+    let x = (u * width as f32 - 0.5).clamp(0.0, width as f32 - 1.0);
+    let y = (v * height as f32 - 0.5).clamp(0.0, height as f32 - 1.0);
+    let (x0, y0) = (x as usize, y as usize);
+    let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
+    let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+    let center = pixels[destination.1 * width + destination.0];
+    let mut result = center;
+    for (sx, sy, weight) in [
+        (x0, y0, (1.0 - tx) * (1.0 - ty)),
+        (x1, y0, tx * (1.0 - ty)),
+        (x0, y1, (1.0 - tx) * ty),
+        (x1, y1, tx * ty),
+    ] {
+        // Detailed balance on a partial edge cell: equal exchange in both
+        // directions is limited by the smaller area; unused weight stays here.
+        let exchange = weight * (area(sx, sy) / destination_area).min(1.0);
+        for c in 0..3 {
+            result[c] += (pixels[sy * width + sx][c] - center[c]) * exchange;
+        }
+    }
+    result
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderQuality {
     High,
@@ -3908,6 +4002,7 @@ pub struct Renderer {
     world_view: Option<([f64; 2], [f64; 2], u64)>,
     retina: crate::retina::Retina,
     effect_time: f64,
+    presentation_reset_pending: bool,
     source_dirty: bool,
     camera_presentation: CameraPresentation,
     output: TerminalOutput,
@@ -3924,6 +4019,7 @@ pub struct Renderer {
     scratch: Vec<[f32; 3]>,
     bloom_a: Vec<[f32; 3]>,
     bloom_b: Vec<[f32; 3]>,
+    bloom_rows: Vec<[f32; 3]>,
     normal_grid: Vec<[f32; 4]>,
     caustic_grid: Vec<f32>,
     sky_envmap: SkyEnvironment,
@@ -3975,6 +4071,7 @@ impl Renderer {
             world_view: None,
             retina: crate::retina::Retina::new(),
             effect_time: 0.0,
+            presentation_reset_pending: false,
             source_dirty: true,
             camera_presentation: CameraPresentation::default(),
             output: TerminalOutput::new(width, height),
@@ -3991,6 +4088,7 @@ impl Renderer {
             scratch: Vec::new(),
             bloom_a: Vec::new(),
             bloom_b: Vec::new(),
+            bloom_rows: Vec::new(),
             normal_grid: Vec::new(),
             caustic_grid: Vec::new(),
             sky_envmap: SkyEnvironment::new(),
@@ -4033,7 +4131,7 @@ impl Renderer {
         // Travel keeps advancing while a hidden window skips rendering. Seed
         // its first visible camera from the current patch, not the old world pose.
         if (self.width == 0 || self.height == 0) && width > 0 && height > 0 {
-            self.camera_presentation.reset();
+            self.reset_presentation();
         }
         self.width = width;
         self.height = height;
@@ -4048,6 +4146,17 @@ impl Renderer {
     }
 
     pub fn invalidate(&mut self) { self.output.invalidate(); }
+
+    /// A known interruption may discard stale temporal state without treating
+    /// a costly active frame as a pause. The next visible frame reanchors time.
+    pub fn reset_presentation(&mut self) {
+        self.presentation_reset_pending = true;
+        self.retina.reset_history();
+        self.camera_presentation.reset();
+        self.prev_cam = None;
+        self.prev_water_time = None;
+        self.source_dirty = true;
+    }
 
     /// A held control may change the scene source without advancing its clocks.
     pub fn invalidate_geometry(&mut self) { self.source_dirty = true; }
@@ -4109,11 +4218,15 @@ impl Renderer {
                     high = high.max(value);
                 }
                 // Flat fields and gentle gradients retain their exact samples.
-                // Only a strong local edge receives a small, energy-balanced resolve.
-                if high - low > 0.035_f32.max(high * 0.14) {
+                // A continuous gate avoids a brightness jump as a moving glint
+                // crosses the absolute or relative edge threshold.
+                let threshold = 0.035_f32.max(high * 0.14);
+                let t = ((high - low - threshold * 0.75) / (threshold * 0.5)).clamp(0.0, 1.0);
+                let weight = 0.24 * t * t * (3.0 - 2.0 * t);
+                if weight > 0.0 {
                     self.scratch[i] = std::array::from_fn(|channel| {
                         let average = neighbors.iter().map(|p| p[channel]).sum::<f32>() * 0.25;
-                        center[channel] + (average - center[channel]) * 0.24
+                        center[channel] + (average - center[channel]) * weight
                     });
                 }
             }
@@ -4264,6 +4377,7 @@ impl Renderer {
         self.scratch.resize(w * h, [0.0; 3]);
         self.bloom_a.resize(w.div_ceil(2) * h.div_ceil(2), [0.0; 3]);
         self.bloom_b.resize(self.bloom_a.len(), [0.0; 3]);
+        self.bloom_rows.resize(w.div_ceil(2) * h, [0.0; 3]);
     }
 
     fn resolve_history(
@@ -4440,33 +4554,53 @@ impl Renderer {
             }
             std::mem::swap(&mut self.hdr_buf, &mut self.scratch);
         }
-        // Bright extraction at half resolution keeps bloom broad and makes its cost bounded.
+        // Extract once, then filter before decimation. [1,3,3,1]/8 is centered
+        // between full-resolution pixels and preserves both subpixel phases'
+        // first moment. A 2x2 box loses that phase and makes moving halos jump.
+        for (bright, pixel) in self.scratch.iter_mut().zip(&self.hdr_buf) {
+            let gate = (1.0 - BLOOM_THRESHOLD / crate::color_pipeline::luminance(*pixel).max(1e-6))
+                .max(0.0);
+            *bright = pixel.map(|c| c * gate);
+        }
+        const DOWNSAMPLE: [f32; 4] = [0.125, 0.375, 0.375, 0.125];
+        for y in 0..h {
+            for x in 0..bw {
+                let mut color = [0.0; 3];
+                for (tap, weight) in DOWNSAMPLE.iter().enumerate() {
+                    let sx = bloom_index((x * 2 + tap) as isize - 1, w);
+                    for (c, value) in self.scratch[y * w + sx].iter().enumerate() {
+                        color[c] += value * weight;
+                    }
+                }
+                self.bloom_rows[y * bw + x] = color;
+            }
+        }
         for y in 0..bh {
             for x in 0..bw {
                 let mut color = [0.0; 3];
-                let mut count = 0.0;
-                for sy in y * 2..(y * 2 + 2).min(h) {
-                    for sx in x * 2..(x * 2 + 2).min(w) {
-                        let p = self.hdr_buf[sy * w + sx];
-                        let y = crate::color_pipeline::luminance(p);
-                        let gate = (1.0 - BLOOM_THRESHOLD / y.max(1e-6)).max(0.0);
-                        for c in 0..3 {
-                            color[c] += p[c] * gate;
-                        }
-                        count += 1.0;
+                for (tap, weight) in DOWNSAMPLE.iter().enumerate() {
+                    let sy = bloom_index((y * 2 + tap) as isize - 1, h);
+                    for (c, value) in self.bloom_rows[sy * bw + x].iter().enumerate() {
+                        color[c] += value * weight;
                     }
                 }
-                self.bloom_a[y * bw + x] = color.map(|c| c / count);
+                self.bloom_a[y * bw + x] = color;
             }
         }
         for y in 0..bh {
             for x in 0..bw {
                 let mut sum = [0.0; 3];
+                let center = self.bloom_a[y * bw + x];
                 for (tap, weight) in BLOOM_KERNEL.iter().enumerate() {
-                    let sx = (x as isize + tap as isize - 2).clamp(0, bw as isize - 1) as usize;
+                    let sx = bloom_index(x as isize + tap as isize - 2, bw);
                     let p = self.bloom_a[y * bw + sx];
+                    let scale = if !w.is_multiple_of(2) && sx + 1 == bw && x + 1 < bw {
+                        0.5
+                    } else {
+                        1.0
+                    };
                     for c in 0..3 {
-                        sum[c] += p[c] * weight;
+                        sum[c] += p[c] * (weight * scale) + center[c] * (weight * (1.0 - scale));
                     }
                 }
                 self.bloom_b[y * bw + x] = sum;
@@ -4475,11 +4609,17 @@ impl Renderer {
         for y in 0..bh {
             for x in 0..bw {
                 let mut sum = [0.0; 3];
+                let center = self.bloom_b[y * bw + x];
                 for (tap, weight) in BLOOM_KERNEL.iter().enumerate() {
-                    let sy = (y as isize + tap as isize - 2).clamp(0, bh as isize - 1) as usize;
+                    let sy = bloom_index(y as isize + tap as isize - 2, bh);
                     let p = self.bloom_b[sy * bw + x];
+                    let scale = if !h.is_multiple_of(2) && sy + 1 == bh && y + 1 < bh {
+                        0.5
+                    } else {
+                        1.0
+                    };
                     for c in 0..3 {
-                        sum[c] += p[c] * weight;
+                        sum[c] += p[c] * (weight * scale) + center[c] * (weight * (1.0 - scale));
                     }
                 }
                 self.bloom_a[y * bw + x] = sum;
@@ -4499,21 +4639,36 @@ impl Renderer {
                     let scale = [640.0_f32 / 545.0, 1.0, 450.0 / 545.0][c];
                     let mut streak = 0.0;
                     for offset in [-13.0_f32, -7.0, -3.0, 3.0, 7.0, 13.0] {
-                        streak +=
-                            sample_hdr(&self.bloom_a, bw, bh, u + offset * scale / bw as f32, v)[c];
+                        streak += sample_bloom(
+                            &self.bloom_a,
+                            bw,
+                            bh,
+                            u + offset * scale / bw as f32,
+                            v,
+                            (w, h),
+                            (x, y),
+                        )[c];
                     }
                     for offset in [-4.0_f32, 4.0] {
-                        streak +=
-                            sample_hdr(&self.bloom_a, bw, bh, u, v + offset * scale / bh as f32)[c]
-                                * 0.35;
+                        streak += sample_bloom(
+                            &self.bloom_a,
+                            bw,
+                            bh,
+                            u,
+                            v + offset * scale / bh as f32,
+                            (w, h),
+                            (x, y),
+                        )[c] * 0.35;
                     }
                     for (dx, dy) in [(-5.0_f32, -5.0), (5.0, -5.0), (-5.0, 5.0), (5.0, 5.0)] {
-                        streak += sample_hdr(
+                        streak += sample_bloom(
                             &self.bloom_a,
                             bw,
                             bh,
                             u + dx * scale / bw as f32,
                             v + dy * scale / bh as f32,
+                            (w, h),
+                            (x, y),
                         )[c] * 0.20;
                     }
                     result[c] = center[c] + (streak / 7.5 - center[c]) * glare;
@@ -4556,8 +4711,8 @@ impl Renderer {
                     &self.bloom_a,
                     bw,
                     bh,
-                    (x as f32 + 0.5) / w as f32,
-                    (y as f32 + 0.5) / h as f32,
+                    (x as f32 + 0.5) / (bw * 2) as f32,
+                    (y as f32 + 0.5) / (bh * 2) as f32,
                 );
                 let original = self.hdr_buf[y * w + x];
                 let y_linear = crate::color_pipeline::luminance(original);
@@ -4581,17 +4736,12 @@ impl Renderer {
             return Ok(());
         }
         self.prepare_buffers();
-        let gap = dt.is_finite() && dt > 0.25;
-        if gap {
-            self.retina.reset_history();
-            self.camera_presentation.reset();
-            self.source_dirty = true;
-        }
-        let transition_dt = if dt.is_finite() && !gap {
+        let transition_dt = if dt.is_finite() && !self.presentation_reset_pending {
             dt.max(0.0)
         } else {
             0.0
         };
+        self.presentation_reset_pending = false;
         let dt = transition_dt;
         self.effect_time += f64::from(transition_dt);
         let scene = SceneFrame::new(self.scene, elapsed, self.intensity);
@@ -4657,8 +4807,8 @@ impl Renderer {
         };
         let w = self.render_width;
         let h = self.render_height;
-        let pixel_footprint = (2.0 * cam.half_w * gw as f32 / w as f32)
-            .max(2.0 * cam.half_h * gh as f32 / h as f32)
+        let pixel_footprint = (2.0 * cam.half_w / w as f32).max(2.0 * cam.half_h / h as f32)
+            * gw.min(gh) as f32
             * cam.pos[2]
             / WATER_SCALE;
         const HIGH_AA: [(f32, f32); 4] = [
@@ -4912,7 +5062,7 @@ mod display_channel_tests {
     }
 
     #[test]
-    fn hidden_view_and_long_gaps_do_not_advance_subjective_phase() {
+    fn hidden_view_restore_reanchors_subjective_phase() {
         let water = Water::new(16, 8);
         let mut renderer = Renderer::new(16, 8);
         renderer.render_at(&water, 7.0, 0.05).unwrap();
@@ -4983,5 +5133,245 @@ mod display_channel_tests {
                 renderer.render_width * renderer.render_height
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod optical_sampling_regressions {
+    use super::*;
+
+    fn saddle_grid(
+        angle: f32,
+        width: usize,
+        height: usize,
+    ) -> Vec<[f32; 4]> {
+        let (sine, cosine) = angle.sin_cos();
+        let levels = Array2::from_shape_fn((width, height), |(x, y)| {
+            let x = (x as f32 - (width / 2) as f32) * PATCH_LENGTH / width as f32;
+            let y = (y as f32 - (height / 2) as f32) * PATCH_LENGTH / height as f32;
+            let a = x * cosine - y * sine;
+            let b = x * sine + y * cosine;
+            4.0 * a * b
+        });
+        let mut normals = Vec::new();
+        precompute_normals(&levels, &mut normals);
+        normals
+    }
+
+    #[test]
+    fn saddle_specular_variance_is_independent_of_grid_rotation() {
+        for (width, height) in [(64, 64), (96, 64), (32, 80)] {
+            let center = width / 2 * height + height / 2;
+            let reference = saddle_grid(0.0, width, height)[center][3];
+            assert!(
+                reference > 0.0001,
+                "mixed curvature was omitted: {reference}"
+            );
+            for angle in [0.13, 0.37, std::f32::consts::FRAC_PI_4, 1.21] {
+                let actual = saddle_grid(angle, width, height)[center][3];
+                assert!(
+                    (actual / reference - 1.0).abs() < 0.0001,
+                    "rotation {angle} on {width}x{height}: variance {actual} vs {reference}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saddle_specular_width_does_not_pulse_between_grid_vertices() {
+        let normals = saddle_grid(0.0, 64, 64);
+        let mut minimum = f32::INFINITY;
+        let mut maximum = 0.0_f32;
+        for i in 0..=64 {
+            let normal = sample_grid4(&normals, 64, 64, (32.0 + i as f32 / 64.0) / 64.0, 0.5);
+            let width = filtered_roughness_squared(normal, 1.0);
+            minimum = minimum.min(width);
+            maximum = maximum.max(width);
+        }
+        assert!(
+            maximum / minimum < 1.08,
+            "a smooth normal field has grid-phase roughness: {minimum}..{maximum}"
+        );
+    }
+
+    #[test]
+    fn spatial_resolve_is_continuous_at_absolute_and_relative_edge_thresholds() {
+        let mut renderer = Renderer::new(7, 4);
+        renderer.prepare_buffers();
+        let center = 3 * renderer.render_width + 3;
+        for (background, threshold) in [(0.0, 0.035), (1.0, 0.14 / 0.86)] {
+            let mut values = Vec::new();
+            for delta in [-0.000001, 0.000001] {
+                renderer.hdr_buf.fill([background; 3]);
+                renderer.hdr_buf[center] = [background + threshold + delta; 3];
+                renderer.resolve_spatial_edges();
+                values.push(renderer.hdr_buf[center][0]);
+            }
+            assert!(
+                (values[1] - values[0]).abs() < 0.0001,
+                "AA threshold changes a pixel discontinuously: {values:?}"
+            );
+        }
+    }
+
+    fn bloom_moments(x: usize) -> ([f64; 3], [f64; 3]) {
+        let mut renderer = Renderer::new(128, 64);
+        renderer.prepare_buffers();
+        let mut scene = SceneFrame::new(SceneKind::Acid, 0.0, 0.0);
+        scene.chromatic_aberration = 0.0;
+        scene.light_dir = [1.0, 0.0, 0.0];
+        let mut camera = Camera::new(0.0, 128, 64, &scene);
+        camera.fwd = [0.0, 0.0, -1.0];
+        camera.right = [1.0, 0.0, 0.0];
+        camera.up = [0.0, 1.0, 0.0];
+        assert!(projected_light_source(&camera, scene.light_dir).is_none());
+        renderer.hdr_buf[64 * 128 + x] = [8.0, 4.0, 2.0];
+        renderer.postprocess(&camera, &scene, 0.0);
+        let mut energy = [0.0; 3];
+        let mut moment = [0.0; 3];
+        for (i, pixel) in renderer.bloom_a.iter().enumerate() {
+            for c in 0..3 {
+                energy[c] += f64::from(pixel[c]) * 4.0;
+                moment[c] += f64::from(pixel[c]) * 4.0 * (2.0 * (i % 64) as f64 + 0.5);
+            }
+        }
+        (energy, std::array::from_fn(|c| moment[c] / energy[c]))
+    }
+
+    #[test]
+    fn moving_bloom_keeps_subpixel_phase_and_channel_energy() {
+        let (energy, centroid) = bloom_moments(62);
+        let input = [8.0, 4.0, 2.0];
+        let gate = 1.0 - BLOOM_THRESHOLD / crate::color_pipeline::luminance(input);
+        for c in 0..3 {
+            assert!((energy[c] - f64::from(input[c] * gate)).abs() < 0.0001);
+        }
+        for x in 63..=66 {
+            let (actual_energy, actual_centroid) = bloom_moments(x);
+            for c in 0..3 {
+                assert!((actual_energy[c] / energy[c] - 1.0).abs() < 0.0001);
+                let movement = actual_centroid[c] - centroid[c];
+                assert!(
+                    (movement - (x - 62) as f64).abs() < 0.0001,
+                    "bloom channel {c} locked to half-resolution cells: x={x}, movement={movement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bloom_cannot_create_colored_energy_at_image_boundaries() {
+        let (reference, _) = bloom_moments(62);
+        for x in [0, 1, 126, 127] {
+            let (actual, _) = bloom_moments(x);
+            for c in 0..3 {
+                assert!(
+                    (actual[c] / reference[c] - 1.0).abs() < 0.0001,
+                    "boundary x={x} altered bloom energy in channel {c}: {} vs {}",
+                    actual[c],
+                    reference[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_bloom_path_preserves_flux_on_odd_tiny_and_even_viewports() {
+        for (w, h) in [
+            (128, 128),
+            (121, 81),
+            (127, 82),
+            (2, 2),
+            (1, 1),
+            (1, 9),
+            (9, 1),
+            (3, 5),
+        ] {
+            // Low's legitimate render grid can have odd dimensions on both axes.
+            let mut renderer = Renderer::new((w * 2 - 1) as u16, h as u16);
+            renderer.set_quality(RenderQuality::Low);
+            renderer.prepare_buffers();
+            assert_eq!((renderer.render_width, renderer.render_height), (w, h));
+            let mut scene = SceneFrame::new(SceneKind::Acid, 0.0, 0.0);
+            scene.chromatic_aberration = 0.0;
+            scene.light_dir = [1.0, 0.0, 0.0];
+            let mut camera = Camera::new(0.0, renderer.width, renderer.height, &scene);
+            camera.fwd = [0.0, 0.0, -1.0];
+            camera.right = [1.0, 0.0, 0.0];
+            camera.up = [0.0, 1.0, 0.0];
+            assert!(projected_light_source(&camera, scene.light_dir).is_none());
+            let mut points = vec![
+                (w / 2, h / 2),
+                (0, h / 2),
+                (w - 1, h / 2),
+                (w / 2, 0),
+                (w / 2, h - 1),
+                (0, 0),
+                (w - 1, 0),
+                (0, h - 1),
+                (w - 1, h - 1),
+            ];
+            points.sort_unstable();
+            points.dedup();
+            for (x, y) in points {
+                let source = [8.0, 4.0, 2.0];
+                renderer.hdr_buf.fill([0.0; 3]);
+                renderer.hdr_buf[y * w + x] = source;
+                renderer.postprocess(&camera, &scene, 0.0);
+                let mut full_flux = [0.0_f64; 3];
+                let mut coarse_flux = [0.0_f64; 3];
+                let bw = w.div_ceil(2);
+                for pixel in &renderer.hdr_buf {
+                    for c in 0..3 {
+                        full_flux[c] += f64::from(pixel[c]);
+                    }
+                }
+                for (i, pixel) in renderer.bloom_a.iter().enumerate() {
+                    let area = (w - (i % bw) * 2).min(2) * (h - (i / bw) * 2).min(2);
+                    for c in 0..3 {
+                        coarse_flux[c] += f64::from(pixel[c]) * area as f64;
+                    }
+                }
+                let gate = 1.0 - BLOOM_THRESHOLD / crate::color_pipeline::luminance(source);
+                for c in 0..3 {
+                    assert!(
+                        (full_flux[c] / f64::from(source[c]) - 1.0).abs() < 0.0001,
+                        "actual HDR flux changed at {w}x{h} ({x},{y}) channel{c}: {} expected{}",
+                        full_flux[c],
+                        source[c]
+                    );
+                    assert!(
+                        (coarse_flux[c] / f64::from(source[c] * gate) - 1.0).abs() < 0.0001,
+                        "area-weighted bloom flux changed at {w}x{h} ({x},{y}) channel{c}: {}",
+                        coarse_flux[c]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slow_active_frames_keep_subjective_time_and_camera_history() {
+        let water = Water::new(16, 8);
+        let mut renderer = Renderer::new(16, 8);
+        renderer.render_at(&water, 7.0, 0.05).unwrap();
+        let phase = renderer.effect_time;
+        for frame in 1..=4 {
+            renderer
+                .render_at(&water, 7.0 + frame as f32 * 0.3, 0.3)
+                .unwrap();
+            assert!(
+                (renderer.effect_time - phase - f64::from(frame as f32 * 0.3)).abs() < 1e-6,
+                "slow active frame was treated as an interruption"
+            );
+        }
+        assert!(
+            renderer
+                .camera_presentation
+                .velocity
+                .iter()
+                .any(|v| v.abs() > 1e-8),
+            "slow active frames reseeded the camera instead of damping it"
+        );
     }
 }

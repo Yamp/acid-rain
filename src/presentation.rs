@@ -61,6 +61,7 @@ impl Timeline {
     fn push(
         &mut self,
         frame: Frame,
+        received_at: Instant,
     ) {
         if let Some(previous) = self.frames.back() {
             if (previous.width, previous.height) != (frame.width, frame.height)
@@ -73,16 +74,17 @@ impl Timeline {
                 if frame.timestamp <= previous.timestamp {
                     return;
                 }
-                // A low-pass interval estimate avoids changing the viewing delay
-                // abruptly when one producer frame takes longer than usual.
-                let desired = frame
-                    .timestamp
-                    .duration_since(previous.timestamp)
-                    .mul_f32(2.0);
-                self.latency = self.latency.mul_f32(0.75) + desired.mul_f32(0.25);
-                self.latency = self
-                    .latency
-                    .clamp(Duration::from_millis(33), Duration::from_millis(150));
+                let interval = frame.timestamp.duration_since(previous.timestamp);
+                // Source time precedes rendering and the mailbox can delay delivery
+                // further. Keep a full source interval behind its observed arrival
+                // age, otherwise the display repeatedly runs out of future samples.
+                let age = received_at.saturating_duration_since(frame.timestamp);
+                let desired = (interval * 2)
+                    .max(age + interval)
+                    .clamp(Duration::from_millis(33), Duration::from_millis(500));
+                // Build the needed reserve immediately; release it gradually when
+                // the producer gets faster, without reversing the display cursor.
+                self.latency = desired.max(self.latency.mul_f32(0.75) + desired.mul_f32(0.25));
             }
         }
         self.frames.push_back(frame);
@@ -127,7 +129,11 @@ impl Timeline {
                 / right.timestamp.duration_since(left.timestamp).as_secs_f32();
             cells.resize(left.cells.len(), ((0, 0, 0), (0, 0, 0)));
             for ((result, a), b) in cells.iter_mut().zip(&left.cells).zip(&right.cells) {
-                *result = (blend_rgb(a.0, b.0, fraction), blend_rgb(a.1, b.1, fraction));
+                *result = if a == b {
+                    *a
+                } else {
+                    (blend_rgb(a.0, b.0, fraction), blend_rgb(a.1, b.1, fraction))
+                };
             }
         }
         target < last_time
@@ -158,6 +164,9 @@ fn blend_rgb(
     b: (u8, u8, u8),
     fraction: f32,
 ) -> (u8, u8, u8) {
+    if a == b {
+        return a;
+    }
     let channel = |a, b| {
         let a = decode_byte(a);
         let b = decode_byte(b);
@@ -436,7 +445,7 @@ where
                     // rather than presenting a late arrival off cadence.
                     deadline = next_presentation_deadline(deadline, Instant::now(), interval);
                 }
-                timeline.push(frame);
+                timeline.push(frame, Instant::now());
                 dirty = true;
             },
             None => {},
@@ -493,8 +502,11 @@ mod tests {
     fn timestamps_interpolate_in_display_linear_light_without_feedback() {
         let t = Instant::now();
         let mut timeline = Timeline::new();
-        timeline.push(frame(t, BLACK));
-        timeline.push(frame(t + Duration::from_millis(50), WHITE));
+        timeline.push(frame(t, BLACK), t);
+        timeline.push(
+            frame(t + Duration::from_millis(50), WHITE),
+            t + Duration::from_millis(50),
+        );
         let mut cells = Vec::new();
         assert!(timeline.sample(t + timeline.latency + Duration::from_millis(25), &mut cells));
         assert_eq!(cells, [((188, 188, 188), (188, 188, 188))]);
@@ -505,8 +517,11 @@ mod tests {
     fn sampling_never_extrapolates_or_reverses_time() {
         let t = Instant::now();
         let mut timeline = Timeline::new();
-        timeline.push(frame(t, BLACK));
-        timeline.push(frame(t + Duration::from_millis(50), WHITE));
+        timeline.push(frame(t, BLACK), t);
+        timeline.push(
+            frame(t + Duration::from_millis(50), WHITE),
+            t + Duration::from_millis(50),
+        );
         let mut cells = Vec::new();
         timeline.sample(t + timeline.latency + Duration::from_millis(40), &mut cells);
         let previous = cells.clone();
@@ -517,23 +532,181 @@ mod tests {
         assert_eq!(timeline.cursor, Some(t + Duration::from_millis(50)));
     }
     #[test]
+    fn delayed_publication_keeps_steady_display_motion_between_source_frames() {
+        let t = Instant::now();
+        let display_interval = Duration::from_nanos(16_666_667);
+        for (period_ms, age_ms) in [(100, 100), (200, 200), (50, 120)] {
+            let period = Duration::from_millis(period_ms);
+            let age = Duration::from_millis(age_ms);
+            let mut timeline = Timeline::new();
+            let mut next_source = t;
+            let mut cells = Vec::new();
+            let mut previous = None;
+            for tick in 0..360 {
+                let now = t + display_interval * tick;
+                while next_source + age <= now {
+                    let intensity = next_source.duration_since(t).as_secs_f32() / 8.0;
+                    let byte = (encode_srgb(intensity) * 255.0).round() as u8;
+                    timeline.push(
+                        frame(next_source, ((byte, byte, byte), (byte, byte, byte))),
+                        next_source + age,
+                    );
+                    next_source += period;
+                }
+                timeline.sample(now, &mut cells);
+                // Startup needs two completed source frames. After warming up,
+                // constant source motion must not alternate holds and jumps.
+                if tick >= 180 {
+                    let cursor = timeline.cursor.expect("missing completed source frames");
+                    if let Some(previous) = previous {
+                        let advance = cursor.duration_since(previous);
+                        assert!(
+                            advance.abs_diff(display_interval) <= Duration::from_micros(1),
+                            "period={period_ms}ms age={age_ms}ms tick={tick}: cursor advanced \
+                             {advance:?} instead of {display_interval:?}"
+                        );
+                    }
+                    let expected = cursor.duration_since(t).as_secs_f32() / 8.0;
+                    let expected_byte = (encode_srgb(expected) * 255.0).round() as u8;
+                    // Source and displayed frames both quantize to sRGB bytes;
+                    // their combined error is at most one output code here.
+                    assert!(
+                        cells[0].0.0.abs_diff(expected_byte) <= 1,
+                        "period={period_ms}ms age={age_ms}ms tick={tick}: byte={} \
+                         expected={expected_byte}",
+                        cells[0].0.0,
+                    );
+                    previous = Some(cursor);
+                }
+            }
+        }
+    }
+    #[test]
+    fn arrival_jitter_keeps_cursor_moving_without_reaching_unpublished_frames() {
+        let t = Instant::now();
+        let display_interval = Duration::from_nanos(16_666_667);
+        let ages_ms = [108, 94, 102, 92, 106, 98];
+        let mut timeline = Timeline::new();
+        let mut cells = Vec::new();
+        let mut source_index = 0;
+        let mut previous = None;
+        for tick in 0..360 {
+            let now = t + display_interval * tick;
+            loop {
+                let timestamp = t + Duration::from_millis(source_index * 100);
+                let arrival = timestamp
+                    + Duration::from_millis(ages_ms[source_index as usize % ages_ms.len()]);
+                if arrival > now {
+                    break;
+                }
+                timeline.push(frame(timestamp, WHITE), arrival);
+                source_index += 1;
+            }
+            timeline.sample(now, &mut cells);
+            if tick >= 180 {
+                let cursor = timeline.cursor.unwrap();
+                assert!(cursor <= timeline.frames.back().unwrap().timestamp);
+                if let Some(previous) = previous {
+                    let advance = cursor.duration_since(previous);
+                    // An 8ms arrival variation is shorter than one refresh. It
+                    // must not turn steady source motion into a held or skipped
+                    // refresh once the interpolation buffer has warmed up.
+                    assert!(advance > Duration::ZERO);
+                    assert!(advance < display_interval * 2);
+                }
+                previous = Some(cursor);
+            }
+        }
+    }
+    #[test]
+    fn first_frame_and_held_controls_are_immediate_and_reset_arrival_estimates() {
+        let t = Instant::now();
+        let mut timeline = Timeline::new();
+        let mut cells = Vec::new();
+        timeline.push(frame(t, BLACK), t + Duration::from_millis(200));
+        assert!(!timeline.sample(t + Duration::from_millis(200), &mut cells));
+        assert_eq!(cells, [BLACK]);
+        assert_eq!(timeline.cursor, Some(t));
+        timeline.push(
+            frame(t + Duration::from_millis(200), WHITE),
+            t + Duration::from_millis(400),
+        );
+        assert_eq!(timeline.latency, Duration::from_millis(400));
+
+        let held_at = t + Duration::from_secs(20);
+        let mut held = frame(t + Duration::from_millis(200), BLACK);
+        held.animate = false;
+        timeline.push(held, held_at);
+        assert!(!timeline.sample(held_at, &mut cells));
+        assert_eq!(cells, [BLACK]);
+        timeline.push(frame(held_at, WHITE), held_at);
+        assert!(!timeline.sample(held_at, &mut cells));
+        assert_eq!(cells, [WHITE]);
+        timeline.push(
+            frame(held_at + Duration::from_millis(50), BLACK),
+            held_at + Duration::from_millis(60),
+        );
+        assert_eq!(timeline.latency, Duration::from_millis(100));
+    }
+    #[test]
+    fn unchanged_cells_and_rgb_channels_match_full_linear_light_blending() {
+        let reference = |a: (u8, u8, u8), b: (u8, u8, u8), fraction: f32| {
+            let channel = |a, b| {
+                let a = decode_byte(a);
+                let b = decode_byte(b);
+                (encode_srgb(a + (b - a) * fraction) * 255.0).round() as u8
+            };
+            (channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
+        };
+        for byte in 0..=255u8 {
+            let a = (byte, byte.rotate_left(2), 255 - byte);
+            for fraction in [0.0, 0.001, 0.25, 0.5, 0.9, 1.0] {
+                assert_eq!(blend_rgb(a, a, fraction), reference(a, a, fraction));
+                let b = (a.2, a.0, a.1);
+                assert_eq!(blend_rgb(a, b, fraction), reference(a, b, fraction));
+            }
+        }
+        let t = Instant::now();
+        let left = vec![((91, 0, 255), (12, 200, 66)), ((3, 7, 18), (255, 0, 70))];
+        let right = vec![left[0], (left[1].0, (0, 255, 222))];
+        let mut timeline = Timeline::new();
+        for (offset, values) in [(0, &left), (100, &right)] {
+            let timestamp = t + Duration::from_millis(offset);
+            let mut source = frame(timestamp, BLACK);
+            source.width = 2;
+            source.cells.clone_from(values);
+            timeline.push(source, timestamp);
+        }
+        let mut cells = Vec::new();
+        timeline.sample(t + timeline.latency + Duration::from_millis(50), &mut cells);
+        let expected: Vec<_> = left
+            .iter()
+            .zip(&right)
+            .map(|(a, b)| (reference(a.0, b.0, 0.5), reference(a.1, b.1, 0.5)))
+            .collect();
+        assert_eq!(cells, expected);
+    }
+    #[test]
     fn resize_pause_and_disabled_output_have_no_cross_frame_blend() {
         let t = Instant::now();
         let mut timeline = Timeline::new();
-        timeline.push(frame(t, BLACK));
+        timeline.push(frame(t, BLACK), t);
         let mut changed = frame(t + Duration::from_millis(50), WHITE);
         changed.width = 2;
         changed.cells.push(WHITE);
-        timeline.push(changed);
+        timeline.push(changed, t + Duration::from_millis(50));
         assert_eq!(timeline.frames.len(), 1);
         let mut paused = frame(t + Duration::from_millis(100), BLACK);
         paused.animate = false;
-        timeline.push(paused);
+        timeline.push(paused, t + Duration::from_millis(100));
         let mut cells = Vec::new();
         assert!(!timeline.sample(t, &mut cells));
         assert_eq!(cells, [BLACK]);
         timeline.set_enabled(false);
-        timeline.push(frame(t + Duration::from_millis(150), WHITE));
+        timeline.push(
+            frame(t + Duration::from_millis(150), WHITE),
+            t + Duration::from_millis(150),
+        );
         assert!(!timeline.sample(t, &mut cells));
         assert_eq!(cells, [WHITE]);
     }
@@ -542,15 +715,16 @@ mod tests {
         let t = Instant::now();
         let mut timeline = Timeline::new();
         for i in 0..100 {
-            timeline.push(frame(t + Duration::from_millis(i * 100), WHITE));
+            let timestamp = t + Duration::from_millis(i * 100);
+            timeline.push(frame(timestamp, WHITE), timestamp + Duration::from_secs(i));
             assert!(timeline.frames.len() <= 8);
             assert!(
-                (Duration::from_millis(33)..=Duration::from_millis(150))
+                (Duration::from_millis(33)..=Duration::from_millis(500))
                     .contains(&timeline.latency)
             );
         }
         let last = timeline.frames.back().unwrap().timestamp;
-        timeline.push(frame(t, BLACK));
+        timeline.push(frame(t, BLACK), t);
         assert_eq!(timeline.frames.back().unwrap().timestamp, last);
         timeline.clear();
         assert!(timeline.frames.is_empty());

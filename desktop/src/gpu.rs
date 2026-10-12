@@ -158,8 +158,23 @@ impl Targets {
     fn new(
         device: &wgpu::Device,
         extent: RenderExtent,
+        drawable: RenderExtent,
     ) -> Self {
-        let hdr = std::array::from_fn(|_| {
+        Self {
+            extent,
+            hdr: Self::hdr(device, extent),
+            retina: Self::retina(
+                device,
+                RetinaHistoryPolicy::extent(drawable.width, drawable.height),
+            ),
+        }
+    }
+
+    fn hdr(
+        device: &wgpu::Device,
+        extent: RenderExtent,
+    ) -> [Texture; 2] {
+        std::array::from_fn(|_| {
             Texture::new(
                 device,
                 "Linear HDR history",
@@ -172,15 +187,20 @@ impl Targets {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             )
-        });
-        let reservoir = RetinaHistoryPolicy::extent(extent.width, extent.height);
-        let retina = std::array::from_fn(|_| {
+        })
+    }
+
+    fn retina(
+        device: &wgpu::Device,
+        extent: RenderExtent,
+    ) -> [[Texture; 3]; 2] {
+        std::array::from_fn(|_| {
             std::array::from_fn(|_| {
                 Texture::new(
                     device,
                     "Unwarped retinal reservoir",
-                    reservoir.width,
-                    reservoir.height,
+                    extent.width,
+                    extent.height,
                     1,
                     wgpu::TextureDimension::D2,
                     wgpu::TextureFormat::Rgba16Float,
@@ -189,12 +209,7 @@ impl Targets {
                         | wgpu::TextureUsages::COPY_SRC,
                 )
             })
-        });
-        Self {
-            extent,
-            hdr,
-            retina,
-        }
+        })
     }
 }
 
@@ -467,6 +482,7 @@ impl GpuRenderer {
         let targets = Targets::new(
             &device,
             RenderPolicy::extent(width, height, RenderQuality::High, 1_200_000),
+            RenderExtent { width, height },
         );
         let offline = if surface.is_none() {
             Some(Self::offline_texture(&device, width, height, format))
@@ -819,6 +835,26 @@ impl GpuRenderer {
         })
     }
 
+    fn ensure_targets(
+        &mut self,
+        extent: RenderExtent,
+    ) {
+        if self.targets.extent != extent {
+            self.targets.hdr = Targets::hdr(&self.device, extent);
+            self.targets.extent = extent;
+            self.history_valid = false;
+        }
+        // Quality controls scene work, not retinal memory. Keep the same GPU
+        // histories and decay phase until the drawable history extent changes.
+        let reservoir = RetinaHistoryPolicy::extent(self.width, self.height);
+        let existing = &self.targets.retina[0][0].texture;
+        if existing.width() != reservoir.width || existing.height() != reservoir.height {
+            self.targets.retina = Targets::retina(&self.device, reservoir);
+            self.retina_policy.invalidate();
+            self.retina_index = 0;
+        }
+    }
+
     fn encode(
         &mut self,
         slot_index: usize,
@@ -833,12 +869,7 @@ impl GpuRenderer {
             input.quality,
             self.policy.automatic_pixel_budget(),
         );
-        if self.targets.extent != extent {
-            self.targets = Targets::new(&self.device, extent);
-            self.history_valid = false;
-            self.retina_policy.invalidate();
-            self.retina_index = 0;
-        }
+        self.ensure_targets(extent);
         self.slots[slot_index].upload(&self.queue, frame)?;
         // Query boundaries belong to actual dependent work: the first cloud
         // pass (or caustics if unchanged) and final post draw, not independent
@@ -964,46 +995,49 @@ impl GpuRenderer {
         let retina = self.retina_policy.advance(input.delta, held);
         if retina.update {
             let next = 1 - self.retina_index;
-            for layer in 0..3 {
-                let parameters = [
-                    retina.alphas[layer],
-                    if retina.seed { 0.0 } else { 1.0 },
-                    0.0,
-                    0.0,
-                ];
-                let constants = slot.uniforms.push(bytemuck::bytes_of(&parameters))?;
-                let output = &self.targets.retina[next][layer];
-                let group = bind(&self.device, &self.pipelines.retina.layout, &[
-                    (1, slot.uniforms.bind(constants)),
-                    (2, view(&self.targets.hdr[current])),
-                    (3, view(&self.targets.retina[self.retina_index][layer])),
-                    (8, view(output)),
-                ]);
-                dispatch(
-                    encoder,
-                    &self.pipelines.retina,
-                    &group,
-                    &self.common_samplers,
-                    [
-                        output.texture.width().div_ceil(8),
-                        output.texture.height().div_ceil(8),
-                        1,
-                    ],
-                );
-                diagnostic::checkpoint(
-                    self.diagnose_passes,
-                    [
-                        "retinal reservoir fast",
-                        "retinal reservoir middle",
-                        "retinal reservoir slow",
-                    ][layer],
-                    encoder,
-                    &self.device,
-                    &self.queue,
-                    &slot.uniforms,
-                    &self.error,
-                )?;
-            }
+            let parameters = [
+                retina.attack_alphas[0],
+                retina.attack_alphas[1],
+                retina.attack_alphas[2],
+                if retina.seed { 0.0 } else { 1.0 },
+                retina.release_alphas[0],
+                retina.release_alphas[1],
+                retina.release_alphas[2],
+                0.0,
+            ];
+            let constants = slot.uniforms.push(bytemuck::bytes_of(&parameters))?;
+            let previous_layers = &self.targets.retina[self.retina_index];
+            let next_layers = &self.targets.retina[next];
+            let group = bind(&self.device, &self.pipelines.retina.layout, &[
+                (2, view(&self.targets.hdr[current])),
+                (5, view(&previous_layers[0])),
+                (6, view(&previous_layers[1])),
+                (7, view(&previous_layers[2])),
+                (8, view(&next_layers[0])),
+                (9, view(&next_layers[1])),
+                (10, view(&next_layers[2])),
+                (11, slot.uniforms.bind(constants)),
+            ]);
+            dispatch(
+                encoder,
+                &self.pipelines.retina,
+                &group,
+                &self.common_samplers,
+                [
+                    next_layers[0].texture.width().div_ceil(8),
+                    next_layers[0].texture.height().div_ceil(8),
+                    1,
+                ],
+            );
+            diagnostic::checkpoint(
+                self.diagnose_passes,
+                "fused retinal reservoirs",
+                encoder,
+                &self.device,
+                &self.queue,
+                &slot.uniforms,
+                &self.error,
+            )?;
             self.retina_index = next;
         }
         let exposure = bind(&self.device, &self.pipelines.exposure.layout, &[
@@ -1388,4 +1422,143 @@ fn cloud_pass(
         errors,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod history_target_tests {
+    use super::*;
+
+    #[test]
+    fn quality_changes_preserve_drawable_retinal_textures_and_history() {
+        if std::env::var("ACID_RAIN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let mut gpu = pollster::block_on(GpuRenderer::new(None, GpuConfig {
+            width: 1280,
+            height: 800,
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
+            timestamp_queries: false,
+        }))
+        .unwrap();
+        gpu.check_error().unwrap();
+        gpu.retina_policy.advance(1.0 / 60.0, false);
+        gpu.retina_index = 1;
+        let previous: Vec<_> = gpu
+            .targets
+            .retina
+            .iter()
+            .flatten()
+            .map(|image| image.texture.clone())
+            .collect();
+        let drawable_history = RetinaHistoryPolicy::extent(1280, 800);
+        for (quality, budget) in [
+            (RenderQuality::Low, 480_000),
+            (RenderQuality::Native, 480_000),
+            (RenderQuality::Balanced, 480_000),
+            (RenderQuality::High, 480_000),
+            (RenderQuality::Auto, 480_000),
+            (RenderQuality::Auto, 1_200_000),
+        ] {
+            let scene = RenderPolicy::extent(1280, 800, quality, budget);
+            gpu.ensure_targets(scene);
+            for (texture, old) in gpu.targets.retina.iter().flatten().zip(&previous) {
+                assert_eq!(
+                    &texture.texture, old,
+                    "changing scene quality must retain every retinal texture"
+                );
+                assert_eq!(
+                    (texture.texture.width(), texture.texture.height()),
+                    (drawable_history.width, drawable_history.height)
+                );
+            }
+            assert_eq!(
+                gpu.retina_index, 1,
+                "quality changes must preserve the current retinal generation"
+            );
+            assert!(
+                !gpu.retina_policy.advance(0.0, true).seed,
+                "quality changes must not clear radiometric history"
+            );
+        }
+        gpu.resize(800, 1280);
+        gpu.ensure_targets(RenderPolicy::extent(
+            800,
+            1280,
+            RenderQuality::High,
+            480_000,
+        ));
+        assert_ne!(
+            gpu.targets.retina[0][0].texture, previous[0],
+            "a real drawable aspect change must allocate new history"
+        );
+        assert!(
+            gpu.retina_policy.advance(0.0, true).seed,
+            "new drawable history must seed once"
+        );
+    }
+
+    #[test]
+    fn full_graph_seeds_all_fused_reservoirs_and_holds_their_contents() {
+        if std::env::var("ACID_RAIN_GPU_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let mut gpu = pollster::block_on(GpuRenderer::new(None, GpuConfig {
+            width: 64,
+            height: 40,
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            force_fallback_adapter: std::env::var("ACID_RAIN_SOFTWARE").as_deref() == Ok("1"),
+            timestamp_queries: false,
+        }))
+        .unwrap();
+        let frame = acid_rain_native_core::Simulation::new(751)
+            .unwrap()
+            .snapshot();
+        let input = RenderInput {
+            held: true,
+            delta: 0.0,
+            quality: RenderQuality::Low,
+            ..Default::default()
+        };
+        assert!(
+            gpu.render(&frame, &input, |_, _, _, _, _, _| {})
+                .unwrap()
+                .submitted
+        );
+        gpu.wait_idle().unwrap();
+        let generation = gpu.retina_index;
+        let expected: Vec<_> = gpu.targets.retina[generation]
+            .iter()
+            .map(|image| read_texture_bytes(&gpu.device, &gpu.queue, &image.texture, 8).unwrap())
+            .collect();
+        assert!(
+            expected[0]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..6].iter().any(|value| *value != 0)),
+            "the fused dispatch must write actual scene radiance"
+        );
+        assert_eq!(
+            expected[0], expected[1],
+            "all three invalid histories must seed from the same prefiltered frame"
+        );
+        assert_eq!(expected[0], expected[2]);
+        assert!(
+            gpu.render(&frame, &input, |_, _, _, _, _, _| {})
+                .unwrap()
+                .submitted
+        );
+        gpu.wait_idle().unwrap();
+        assert_eq!(
+            gpu.retina_index, generation,
+            "held frames must not advance the reservoir generation"
+        );
+        for (image, before) in gpu.targets.retina[generation].iter().zip(expected) {
+            assert_eq!(
+                read_texture_bytes(&gpu.device, &gpu.queue, &image.texture, 8).unwrap(),
+                before
+            );
+        }
+    }
 }

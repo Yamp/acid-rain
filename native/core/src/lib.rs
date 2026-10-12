@@ -76,6 +76,28 @@ const LIGHT_SIZE: usize = 64;
 const BED_MIN: f32 = -1.5;
 const BED_SPAN: f32 = 5.0;
 
+fn cubic_height_envelope(bounds: [f32; 2]) -> [f32; 2] {
+    if bounds[0] == bounds[1] {
+        return bounds;
+    }
+    // A Catmull-Rom axis has negative weight mass <= 1/8. In the
+    // separable 2D kernel it is <= 2*(1/8)*(1+1/8) = 9/32. Thus
+    // these bounds cover every clamped-edge patch, including overshoot.
+    let low = f64::from(bounds[0]);
+    let high = f64::from(bounds[1]);
+    let padding = (high - low) * (9.0 / 32.0);
+    let exact = [low - padding, high + padding];
+    let mut envelope = exact.map(|value| value as f32);
+    // Camera fitting and root brackets need outward, not nearest, rounding.
+    if f64::from(envelope[0]) > exact[0] {
+        envelope[0] = envelope[0].next_down();
+    }
+    if f64::from(envelope[1]) < exact[1] {
+        envelope[1] = envelope[1].next_up();
+    }
+    envelope
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Float4(pub [f32; 4]);
@@ -258,18 +280,10 @@ impl Core {
         {
             return None;
         }
-        let x = (local[0] as f32 * 0.5 * WATER_WIDTH as f32).min((WATER_WIDTH - 1) as f32);
-        let y = (local[1] as f32 * 0.5 * WATER_HEIGHT as f32).min((WATER_HEIGHT - 1) as f32);
-        let x0 = x as usize;
-        let y0 = y as usize;
-        let x1 = (x0 + 1).min(WATER_WIDTH - 1);
-        let y1 = (y0 + 1).min(WATER_HEIGHT - 1);
-        let tx = x - x0 as f32;
-        let ty = y - y0 as f32;
-        let levels = &self.water.levels;
-        let a = levels[[x0, y0]] * (1.0 - tx) + levels[[x1, y0]] * tx;
-        let b = levels[[x0, y1]] * (1.0 - tx) + levels[[x1, y1]] * tx;
-        Some(a * (1.0 - ty) + b * ty)
+        Some(
+            self.water
+                .sample_cubic_surface(local.map(|value| value as f32 * 0.5))[0],
+        )
     }
 
     fn spawn_drop(
@@ -471,7 +485,7 @@ impl Core {
                     [velocity[0], velocity[1], 0.0, self.water.depths[source]];
             }
         }
-        bounds
+        cubic_height_envelope(bounds)
     }
 
     fn refresh(&mut self) {
@@ -797,6 +811,102 @@ mod bridge_tests {
         assert_eq!(std::mem::offset_of!(ARSnapshot, drops), 376);
         assert_eq!(std::mem::offset_of!(ARSnapshot, flow), 400);
         assert_eq!(std::mem::size_of::<ARSnapshot>(), 416);
+    }
+
+    #[test]
+    fn exported_height_envelope_contains_interpolating_cubic_extrema() {
+        let mut core = Core::new(42);
+        // At a half-cell Catmull-Rom has weights [-1,9,9,-1]/16.
+        // Choose independent corner data that maximizes each signed tensor
+        // coefficient: the interpolant reaches 1 + 9/32 outside [0,1].
+        let weights = [-1.0_f64 / 16.0, 9.0 / 16.0, 9.0 / 16.0, -1.0 / 16.0];
+        for inverted in [false, true] {
+            core.water.levels.fill(0.0);
+            let mut interpolated = 0.0;
+            for (x, wx) in weights.into_iter().enumerate() {
+                for (y, wy) in weights.into_iter().enumerate() {
+                    let value = f32::from((wx * wy > 0.0) != inverted);
+                    core.water.levels[[80 + x, 60 + y]] = value;
+                    interpolated += wx * wy * f64::from(value);
+                }
+            }
+            core.refresh();
+            let world = core.snapshot().uniforms.world.0;
+            assert!(
+                f64::from(world[1]) <= interpolated && interpolated <= f64::from(world[2]),
+                "cubic height {interpolated} escaped exported camera/intersection envelope {:?}",
+                &world[1..=2]
+            );
+            assert!(world[1].is_finite() && world[2].is_finite());
+        }
+    }
+
+    #[test]
+    fn flat_height_envelope_stays_exact_and_finite() {
+        let mut core = Core::new(42);
+        for height in [0.0, -0.75, 0.37] {
+            core.water.levels.fill(height);
+            assert_eq!(core.pack_water(), [height, height]);
+            assert!(core.water_pixels.iter().all(|pixel| pixel[0] == height));
+        }
+    }
+
+    #[test]
+    fn cubic_surface_contact_stops_at_a_crest_between_lattice_nodes() {
+        let mut core = Core::new(42);
+        core.water.levels.fill(0.0);
+        for y in 0..WATER_HEIGHT {
+            core.water.levels[[80, y]] = 0.08;
+            core.water.levels[[81, y]] = 0.08;
+        }
+        let origin = core.water.world_origin();
+        let world = [origin[0] + 2.0 * 80.5 / WATER_WIDTH as f64, origin[1] + 1.0];
+        let height = core.surface_height(world).unwrap();
+        // [0,.08,.08,0] has a Catmull crest at .09, not the bilinear .08.
+        assert!((height - 0.09).abs() < 1e-7, "sampled {height}");
+        let mut drop = drops::Drop::new(1, world, 0.0, 0.09, 0.2, 1.5);
+        let contact = (-0.45_f64
+            + (0.45_f64.powi(2) + 2.0 * f64::from(physics::GRAVITY) * 0.42).sqrt())
+            / f64::from(physics::GRAVITY);
+        assert!(
+            drop.advance(contact + 0.0001, height),
+            "sphere passed below visible crest before contact"
+        );
+        assert!((drop.impact.unwrap() - contact).abs() < 1e-6);
+        assert!((drop.z - 0.09).abs() < 1e-7);
+    }
+
+    #[test]
+    fn cubic_envelope_covers_signed_weight_extrema_at_every_cell_phase() {
+        let axis = |t: f64| {
+            let t2 = t * t;
+            let t3 = t2 * t;
+            [
+                -0.5 * t + t2 - 0.5 * t3,
+                1.0 - 2.5 * t2 + 1.5 * t3,
+                0.5 * t + 2.0 * t2 - 1.5 * t3,
+                -0.5 * t2 + 0.5 * t3,
+            ]
+        };
+        for bounds in [[-0.2, 0.5], [-1e6, 2e6], [1e-20, 7e-20]] {
+            let envelope = cubic_height_envelope(bounds);
+            assert!(envelope.iter().all(|value| value.is_finite()));
+            for x in 0..=64 {
+                for y in 0..=64 {
+                    let mut extrema = [0.0; 2];
+                    for wx in axis(f64::from(x) / 64.0) {
+                        for wy in axis(f64::from(y) / 64.0) {
+                            let weight = wx * wy;
+                            let positive = usize::from(weight >= 0.0);
+                            extrema[0] += weight * f64::from(bounds[1 - positive]);
+                            extrema[1] += weight * f64::from(bounds[positive]);
+                        }
+                    }
+                    assert!(f64::from(envelope[0]) <= extrema[0]);
+                    assert!(f64::from(envelope[1]) >= extrema[1]);
+                }
+            }
+        }
     }
 
     #[test]

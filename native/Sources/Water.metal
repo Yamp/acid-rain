@@ -25,11 +25,37 @@ float4 field(texture2d<float> tex, float2 metres) {
     float2 n = float2(tex.get_width(), tex.get_height());
     return tex.sample(linearClamp, metres * .5f + .5f / n, level(0));
 }
+// Positive cubic B-spline reconstruction: four bilinear taps represent the
+// separable 4x4 kernel. Partition of unity preserves radiance and affine slopes;
+// continuous first derivatives remove magnified environment texel bends.
+float4 opticalCubicAxis(float f) {
+    float a = 1-f, f2 = f*f, f3 = f2*f;
+    float4 w = float4(a*a*a, 3*f3-6*f2+4, -3*f3+3*f2+3*f+1, f3)/6;
+    float2 g = float2(w.x+w.y,w.z+w.w);
+    return float4(w.y/g.x-1, w.w/g.y+1, g);
+}
+float4 opticalCubicSample(texture2d<float> tex, sampler sampling, float2 uv) {
+    float2 size = float2(tex.get_width(),tex.get_height());
+    float2 p = uv*size-.5f, cell = floor(p);
+    float4 x = opticalCubicAxis(p.x-cell.x), y = opticalCubicAxis(p.y-cell.y);
+    float2 lo = (cell+float2(x.x,y.x)+.5f)/size;
+    float2 hi = (cell+float2(x.y,y.y)+.5f)/size;
+    return mix(mix(tex.sample(sampling,lo,level(0)),
+                   tex.sample(sampling,float2(hi.x,lo.y),level(0)),x.w),
+               mix(tex.sample(sampling,float2(lo.x,hi.y),level(0)),
+                   tex.sample(sampling,hi,level(0)),x.w),y.w);
+}
+float3 surfaceNormal(texture2d<float> water, float2 metres) {
+    float2 slope = waterSurface(water,metres).yz;
+    return normalize(float3(-slope,1));
+}
 float3 environment(texture2d<float> sky, float3 direction) {
     direction = normalize(direction);
-    float2 uv = float2(atan2(direction.y, direction.x) / (2 * PI),
+    // Longitude is arbitrary at either pole; avoid atan2(0,0) reaching floor.
+    float longitude = dot(direction.xy,direction.xy) > 1e-12f ? atan2(direction.y,direction.x) : 0.f;
+    float2 uv = float2(longitude / (2 * PI),
                        acos(clamp(direction.z, -1.f, 1.f)) / PI);
-    return sky.sample(skySampler, uv, level(0)).rgb;
+    return opticalCubicSample(sky, skySampler, uv).rgb;
 }
 float3 pigmentTau(float3 mass) {
     mass = max(mass, 0.f);
@@ -66,10 +92,73 @@ float heightResidual(texture2d<float> water, float3 eye, float3 ray, float dista
     float3 p = eye + ray * distance;
     return p.z - field(water, p.xy).x;
 }
-float3 intersectWater(texture2d<float> water, float3 eye, float3 ray,
-                      constant Uniforms &u) {
+struct WaterIntersection { float3 point; float2 slope; float height, distance; };
+WaterIntersection refineWaterIntersectionCached(texture2d<float> water,float3 eye,float3 ray,
+    float3 seed,WaterSurfacePatch patch,float2 bracket) {
+    float distance=max(0.f,dot(seed-eye,ray));
+    float3 point=eye+ray*distance;
+    float cellDistance=1.f/max(length(ray.xy*patch.scale),1e-5f);
+    for (uint iteration=0;iteration<4;++iteration) {
+        int2 cell=int2(floor(point.xy*patch.scale));
+        if (any(cell!=patch.cell)) patch=waterSurfacePatch(water,point.xy);
+        float3 surface=waterSurfaceValue(patch,point.xy);
+        float residual=point.z-surface.x;
+        float derivative=ray.z-dot(surface.yz,ray.xy);
+        if (abs(residual)<1e-7f || abs(derivative)<1e-5f) return {point,surface.yz,surface.x,distance};
+        float next=max(0.f,distance-clamp(residual/derivative,-cellDistance,cellDistance));
+        if (next<bracket.x || next>bracket.y) return {point,surface.yz,surface.x,distance};
+        distance=next;
+        point=eye+ray*distance;
+    }
+    // The final Newton update may have changed cells. Return the derivative
+    // at that exact point, reusing the coefficients only when still valid.
+    if (any(int2(floor(point.xy*patch.scale))!=patch.cell)) patch=waterSurfacePatch(water,point.xy);
+    float3 surface=waterSurfaceValue(patch,point.xy);
+    return {point,surface.yz,surface.x,distance};
+}
+WaterIntersection refineWaterIntersectionData(texture2d<float> water,float3 eye,float3 ray,float3 seed) {
+    float3 point=eye+ray*max(0.f,dot(seed-eye,ray));
+    return refineWaterIntersectionCached(water,eye,ray,seed,waterSurfacePatch(water,point.xy),float2(0,1e30f));
+}
+WaterIntersection cubicWaterBracket(texture2d<float> water,float3 eye,float3 ray,float near,float far) {
+    float3 left=eye+ray*near,right=eye+ray*far;
+    float3 ls=waterSurface(water,left.xy),rs=waterSurface(water,right.xy);
+    float a=left.z-ls.x,b=right.z-rs.x;
+    WaterIntersection best=abs(a)<abs(b) ? WaterIntersection{left,ls.yz,ls.x,near} : WaterIntersection{right,rs.yz,rs.x,far};
+    float error=min(abs(a),abs(b));
+    // Callers provide finite fields and a verified cubic bracket. An invalid
+    // bracket returns the best endpoint rather than inventing a sign change.
+    if (!isfinite(a) || !isfinite(b) || (a>0)==(b>0)) return best;
+    WaterSurfacePatch patch=waterSurfacePatch(water,left.xy);
+    for (uint iteration=0;iteration<28;++iteration) {
+        if (error<=1e-7f) break;
+        float middle=.5f*(near+far);
+        if (middle==near || middle==far) break;
+        float3 point=eye+ray*middle;
+        if (any(int2(floor(point.xy*patch.scale))!=patch.cell)) patch=waterSurfacePatch(water,point.xy);
+        float3 surface=waterSurfaceValue(patch,point.xy);
+        float residual=point.z-surface.x;
+        if (abs(residual)<error) { best={point,surface.yz,surface.x,middle}; error=abs(residual); }
+        if ((residual>0)==(a>0)) { near=middle; a=residual; }
+        else { far=middle; b=residual; }
+    }
+    return best;
+}
+WaterIntersection acceptWaterIntersection(texture2d<float> water,float3 eye,float3 ray,
+    WaterIntersection candidate,float near,float far) {
+    // Retain the computed parameter: reconstructing it with dot(point-eye,ray)
+    // can move a converged endpoint outside its bracket by a rounding ULP.
+    if (abs(candidate.point.z-candidate.height)<=1e-6f && candidate.distance>=near && candidate.distance<=far) return candidate;
+    return cubicWaterBracket(water,eye,ray,near,far);
+}
+float3 refineWaterIntersection(texture2d<float> water,float3 eye,float3 ray,float3 seed) {
+    return refineWaterIntersectionData(water,eye,ray,seed).point;
+}
+WaterIntersection intersectWaterData(texture2d<float> water, float3 eye, float3 ray,
+                                     constant Uniforms &u) {
     float near = max(0.f, (u.world.z + .00001f - eye.z) / ray.z);
     float far = (u.world.y - .00001f - eye.z) / ray.z;
+    float2 bracket=float2(near,far);
     float a = heightResidual(water, eye, ray, near);
     float b = heightResidual(water, eye, ray, far);
     // Frustum fitting guarantees the primary bracket lies entirely in the patch.
@@ -80,7 +169,22 @@ float3 intersectWater(texture2d<float> water, float3 eye, float3 ray,
         if (value > 0) { near = m; a = value; }
         else { far = m; b = value; }
     }
-    return eye + ray * mix(near, far, saturate(a / max(a - b, 1e-9f)));
+    float3 seed=eye+ray*mix(near,far,saturate(a/max(a-b,1e-9f)));
+    float seedDistance=max(0.f,dot(seed-eye,ray));
+    float3 point=eye+ray*seedDistance;
+    WaterSurfacePatch patch=waterSurfacePatch(water,point.xy);
+    float seedResidual=point.z-waterSurfaceValue(patch,point.xy).x;
+    // A known inside point prevents Newton from jumping through this crest to
+    // an unrelated later root. Preserve the original global bracket, not the
+    // interval narrowed against the different bilinear seed surface.
+    if (seedDistance>bracket.x && seedDistance<bracket.y) {
+        if (seedResidual>0) bracket.x=seedDistance; else bracket.y=seedDistance;
+    }
+    WaterIntersection result=refineWaterIntersectionCached(water,eye,ray,seed,patch,bracket);
+    return acceptWaterIntersection(water,eye,ray,result,bracket.x,bracket.y);
+}
+float3 intersectWater(texture2d<float> water,float3 eye,float3 ray,constant Uniforms &u) {
+    return intersectWaterData(water,eye,ray,u).point;
 }
 
 float3 extinction(constant Uniforms &u) {
@@ -222,9 +326,11 @@ float3 bedRadiance(texture2d<float> water, texture2d<float> dye, texture2d<float
     return result + cloud.radiance;
 }
 
-bool secondaryHit(texture2d<float> water, float3 start, float3 ray,
-                  thread float3 &hit, constant Uniforms &u) {
-    if (ray.z > .45f || (start.z > u.world.z + .002f && ray.z >= 0)) return false;
+bool secondarySurfaceHit(texture2d<float> water, float3 start, float3 ray,
+                         thread WaterIntersection &hit, constant Uniforms &u) {
+    // An upward ray can still meet a steeper crest. Only its position above
+    // the conservative cubic-height envelope proves that no hit is possible.
+    if (start.z > u.world.z + .002f && ray.z >= 0) return false;
     float near = .001f;
     // Quadratic spacing resolves nearby folds while keeping a bounded work budget.
     for (uint i = 1; i <= 14; ++i) {
@@ -232,18 +338,34 @@ bool secondaryHit(texture2d<float> water, float3 start, float3 ray,
         float3 p = start + ray * far;
         if (any(p.xy < 0.f) || any(p.xy > 2.f) || (p.z > u.world.z + .001f && ray.z > 0))
             return false;
-        if (p.z < field(water, p.xy).x) {
+        if (p.z < waterSurface(water,p.xy).x) {
+            float3 nearPoint=start+ray*near;
+            if (nearPoint.z-waterSurface(water,nearPoint.xy).x<0) {
+                near=0;
+                if (start.z-waterSurface(water,start.xy).x<0) return false;
+            }
             for (uint k = 0; k < 7; ++k) {
                 float mid = .5f * (near + far);
-                if (heightResidual(water, start, ray, mid) > 0) near = mid;
+                float3 midPoint=start+ray*mid;
+                if (midPoint.z-waterSurface(water,midPoint.xy).x > 0) near = mid;
                 else far = mid;
             }
-            hit = start + ray * (.5f * (near + far));
+            float3 seed=start+ray*(.5f*(near+far));
+            float3 point=start+ray*max(0.f,dot(seed-start,ray));
+            WaterSurfacePatch patch=waterSurfacePatch(water,point.xy);
+            WaterIntersection candidate=refineWaterIntersectionCached(water,start,ray,seed,patch,float2(near,far));
+            hit=acceptWaterIntersection(water,start,ray,candidate,near,far);
             return true;
         }
         near = far;
     }
     return false;
+}
+bool secondaryHit(texture2d<float> water,float3 start,float3 ray,thread float3 &hit,constant Uniforms &u) {
+    WaterIntersection result;
+    bool found=secondarySurfaceHit(water,start,ray,result,u);
+    if (found) hit=result.point;
+    return found;
 }
 float3 reflectedRadiance(texture2d<float> water, texture2d<float> dye,
                          texture2d<float> bed, texture2d<float> sky,
@@ -255,10 +377,10 @@ float3 reflectedRadiance(texture2d<float> water, texture2d<float> dye,
     float3 result = 0, throughput = 1;
     uint limit = uint(clamp(u.post.y, 0.f, 2.f));
     for (uint bounce = 0; bounce < limit; ++bounce) {
-        float3 hit;
-        if (!secondaryHit(water, position, direction, hit, u)) break;
-        float4 surface = field(water, hit.xy);
-        float3 n = normalize(float3(-surface.yz, 1));
+        WaterIntersection intersection;
+        if (!secondarySurfaceHit(water, position, direction, intersection, u)) break;
+        float3 hit=intersection.point;
+        float3 n=normalize(float3(-intersection.slope,1));
         float3 f = fresnel(-dot(direction, n));
         // Radiance / n² is invariant along a lossless refracted ray. Caustic
         // flux has no eta² factor; underwater radiance exits into air here.
@@ -272,6 +394,53 @@ float3 reflectedRadiance(texture2d<float> water, texture2d<float> dye,
     return result + throughput * environment(sky, direction);
 }
 
+float3 directHighlight(float3 n, float3 view, float3 light) {
+    if (dot(n,view) <= 0 || dot(n,light) <= 0) return 0;
+    float ndv = max(.001f,dot(n,view)), ndl = max(.001f,dot(n,light));
+    float3 halfway = normalize(light+view);
+    float ndh = max(0.f,dot(n,halfway));
+    float a2 = .0025f;
+    float denom = ndh*ndh*(a2-1)+1;
+    float d = a2/max(PI*denom*denom,1e-8f);
+    float smith = 2*ndv*ndl/max(ndl*sqrt(a2+(1-a2)*ndv*ndv)
+        +ndv*sqrt(a2+(1-a2)*ndl*ndl),1e-7f);
+    return fresnel(dot(view,halfway))*d*smith*.18f/(4*ndv);
+}
+float3 directHighlightPixel(float3 n, float3 view, float3 light,
+                            float3 nx, float3 ny, float3 vx, float3 vy) {
+    // Adapt each axis to the angular footprint / physical alpha=.05. The
+    // positive Gauss weights integrate pixel area without roughness inflation.
+    // Four BRDF evaluations for ordinary pixels, at most 256 for steep folds;
+    // no additional water intersections or volume samples.
+    float2 width=float2(length(nx)+.5f*length(vx),length(ny)+.5f*length(vy));
+    uint2 count=uint2(width.x>.2f ? 16u : (width.x>.1f ? 8u : (width.x>.04f ? 4u : 2u)),
+                     width.y>.2f ? 16u : (width.y>.1f ? 8u : (width.y>.04f ? 4u : 2u)));
+    constexpr float nodes[30]={-.2886751346f,.2886751346f,
+        -.4305681558f,-.1699905218f,.1699905218f,.4305681558f,
+        -.4801449282f,-.3983332387f,-.262766205f,-.0917173212f,
+         .0917173212f,.262766205f,.3983332387f,.4801449282f,
+        -.4947004675f,-.4722875115f,-.4328156012f,-.3777022042f,
+        -.3089381222f,-.2290083888f,-.1408017754f,-.0475062549f,
+         .0475062549f,.1408017754f,.2290083888f,.3089381222f,
+         .3777022042f,.4328156012f,.4722875115f,.4947004675f};
+    constexpr float weights[30]={.5f,.5f,
+        .1739274226f,.3260725774f,.3260725774f,.1739274226f,
+        .0506142681f,.1111905172f,.1568533229f,.1813418917f,
+        .1813418917f,.1568533229f,.1111905172f,.0506142681f,
+        .0135762297f,.031126762f,.0475792558f,.0623144856f,
+        .0747979944f,.0845782597f,.0913017075f,.0947253052f,
+        .0947253052f,.0913017075f,.0845782597f,.0747979944f,
+        .0623144856f,.0475792558f,.031126762f,.0135762297f};
+    uint2 base=count-2;
+    float3 result = 0;
+    for (uint y=0; y<count.y; ++y) for (uint x=0; x<count.x; ++x) {
+        float2 offset=float2(nodes[base.x+x],nodes[base.y+y]);
+        result+=directHighlight(normalize(n+nx*offset.x+ny*offset.y),
+            normalize(view+vx*offset.x+vy*offset.y),light)*weights[base.x+x]*weights[base.y+y];
+    }
+    return result;
+}
+
 fragment float4 waterFragment(VertexOut in [[stage_in]],
     constant Uniforms &u [[buffer(0)]], constant float4 &bedWorld [[buffer(2)]],
     texture2d<float> water [[texture(0)]], texture2d<float> dye [[texture(1)]],
@@ -281,10 +450,11 @@ fragment float4 waterFragment(VertexOut in [[stage_in]],
     float2 screen = float2(in.uv.x * 2 - 1, 1 - in.uv.y * 2);
     float3 ray = normalize(u.forward.xyz + screen.x * u.right.w * u.right.xyz
                          + screen.y * u.up.w * u.up.xyz);
-    float3 point = intersectWater(water, u.eye.xyz, ray, u);
+    WaterIntersection intersection=intersectWaterData(water,u.eye.xyz,ray,u);
+    float3 point=intersection.point;
     float footprint = max(length(dfdx(point.xy)), length(dfdy(point.xy)));
     float4 surface = field(water, point.xy);
-    float3 n = normalize(float3(-surface.yz, 1));
+    float3 n = normalize(float3(-intersection.slope,1));
     float3 view = -ray;
     if (dot(n, view) < .001f) n = normalize(n + view * (.001f - dot(n, view)));
     float ndv = max(.001f, dot(n, view));
@@ -296,18 +466,8 @@ fragment float4 waterFragment(VertexOut in [[stage_in]],
         point, n, ray, u, bedWorld, footprint, true, cloudSteps);
 
     float3 l = normalize(u.light.xyz);
-    float3 halfVector = normalize(l + view);
-    float ndl = max(.001f, dot(n, l));
-    float ndh = max(0.f, dot(n, halfVector));
-    // Derivative-filtered GGX prevents subpixel highlights sparkling on Retina.
-    float3 dx = dfdx(n), dy = dfdy(n);
-    float a2 = clamp(.0025f + .5f * (dot(dx, dx) + dot(dy, dy)), .0025f, .25f);
-    float denom = ndh * ndh * (a2 - 1) + 1;
-    float d = a2 / max(PI * denom * denom, 1e-8f);
-    float smith = 2 * ndv * ndl / max(ndl * sqrt(a2 + (1 - a2) * ndv * ndv)
-                                    + ndv * sqrt(a2 + (1 - a2) * ndl * ndl), 1e-7f);
     float3 emitter = environment(sky, l);
-    float3 specular = fresnel(dot(view, halfVector)) * emitter * d * smith * .18f / (4 * ndv);
+    float3 specular = emitter*directHighlightPixel(n,view,l,dfdx(n),dfdy(n),dfdx(view),dfdy(view));
 
     float3 radiance = f * reflected + specular + (1 - f) * transmitted / (IOR * IOR);
     float foam = saturate(surface.w);
@@ -408,18 +568,59 @@ float3 toneMap(float3 hdr, float exposure, constant Uniforms &u) {
     return rgb * (tone / p);
 }
 
-// Reservoirs contain only unwarped scene-linear HDR; subjective transformations
-// never feed back into them. state = (update alpha, prior valid, reserved, reserved).
-kernel void retinaHistoryUpdate(texture2d<float> current [[texture(0)]],
-    texture2d<float> previous [[texture(1)]], texture2d<float,access::write> next [[texture(2)]],
-    constant float4 &state [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= next.get_width() || p.y >= next.get_height()) return;
-    float2 uv = (float2(p)+.5f)/float2(next.get_width(),next.get_height());
-    float3 now = max(current.sample(linearClamp,uv,level(0)).rgb,0.f);
-    if (state.y <= 0) { next.write(float4(now,1),p); return; }
-    float3 old = previous.sample(linearClamp,uv,level(0)).rgb;
-    if (!all(isfinite(old))) old = now;
-    next.write(float4(mix(old,now,saturate(state.x)),1),p);
+// Exact finite-volume restriction of piecewise-constant radiance. Each output
+// covers its complete source-pixel footprint, including fractional edge areas.
+// Across the image the work is O(source pixels + output pixels), even at Native
+// resolutions; no fixed tap count can discard small highlights between samples.
+float3 retinaAreaAverage(texture2d<float,access::read> current, uint2 p, uint2 outputSize) {
+    uint2 size = uint2(current.get_width(),current.get_height());
+    float2 scale = float2(size)/float2(outputSize);
+    float2 lo = float2(p)*scale;
+    float2 hi = min(float2(p+1)*scale,float2(size));
+    uint2 first = min(uint2(floor(lo)),size-1);
+    uint2 end = min(uint2(ceil(hi)),size);
+    float3 sum = 0;
+    for (uint y = first.y; y < end.y; ++y) {
+        float wy = max(0.f,min(hi.y,float(y+1))-max(lo.y,float(y)));
+        for (uint x = first.x; x < end.x; ++x) {
+            float wx = max(0.f,min(hi.x,float(x+1))-max(lo.x,float(x)));
+            sum += max(current.read(uint2(x,y)).rgb,0.f)*(wx*wy);
+        }
+    }
+    return sum/max((hi.x-lo.x)*(hi.y-lo.y),1e-12f);
+}
+
+struct RetinaUpdateParameters { float4 attack, release; };
+
+float3 retinaIntegrate(float3 now, float3 old, float attack, float release) {
+    if (!all(isfinite(old))) return now;
+    // Shared RGB response preserves the captured spectrum. Convex integration
+    // cannot exceed the input/history envelope or feed subjective color back.
+    float alpha = dot(now,LUMA) > dot(old,LUMA) ? attack : release;
+    return mix(old,now,saturate(alpha));
+}
+
+// Reservoirs contain only unwarped scene-linear HDR; distortions are output-only.
+// attack.xyz/release.xyz are wall-time coefficients; attack.w is prior-valid.
+// All three layers share the exact area restriction in this single dispatch.
+kernel void retinaHistoryUpdate(texture2d<float,access::read> current [[texture(0)]],
+    texture2d<float,access::read> oldFast [[texture(1)]],
+    texture2d<float,access::read> oldMiddle [[texture(2)]],
+    texture2d<float,access::read> oldSlow [[texture(3)]],
+    texture2d<float,access::write> nextFast [[texture(4)]],
+    texture2d<float,access::write> nextMiddle [[texture(5)]],
+    texture2d<float,access::write> nextSlow [[texture(6)]],
+    constant RetinaUpdateParameters &state [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    uint2 size = uint2(nextFast.get_width(),nextFast.get_height());
+    if (any(p >= size)) return;
+    float3 now = retinaAreaAverage(current,p,size);
+    if (state.attack.w <= 0) {
+        nextFast.write(float4(now,1),p); nextMiddle.write(float4(now,1),p); nextSlow.write(float4(now,1),p);
+        return;
+    }
+    nextFast.write(float4(retinaIntegrate(now,oldFast.read(p).rgb,state.attack.x,state.release.x),1),p);
+    nextMiddle.write(float4(retinaIntegrate(now,oldMiddle.read(p).rgb,state.attack.y,state.release.y),1),p);
+    nextSlow.write(float4(retinaIntegrate(now,oldSlow.read(p).rgb,state.attack.z,state.release.z),1),p);
 }
 
 float retinaHistoryChromaRetention(float3 now, float3 old) {
@@ -487,8 +688,8 @@ float3 retinaTemporal(texture2d<float> current, texture2d<float> previous,
         dot(direction,normalize(b+.001f)),dot(direction,normalize(c+.001f))));
     affinity *= float3(retinaHistoryChromaRetention(now,a),retinaHistoryChromaRetention(now,b),
                        retinaHistoryChromaRetention(now,c));
-    float3 weights = float3(.10f,.105f,.075f)*min(dose,1.7f)*affinity;
-    // Sum <= .476: every old layer has a nonnegative, bounded contribution.
+    float3 weights = float3(.12f,.11f,.09f)*min(dose,1.7f)*affinity;
+    // Sum <= .544: every old layer has a nonnegative, bounded contribution.
     return now*(1-dot(weights,float3(1)))+a*weights.x+b*weights.y+c*weights.z;
 }
 

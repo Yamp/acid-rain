@@ -72,7 +72,8 @@ impl PresentationClock {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RetinaHistoryStep {
     pub time: f32,
-    pub alphas: [f32; 3],
+    pub attack_alphas: [f32; 3],
+    pub release_alphas: [f32; 3],
     pub update: bool,
     pub seed: bool,
 }
@@ -82,7 +83,8 @@ pub struct RetinaHistoryPolicy {
     time: f64,
 }
 impl RetinaHistoryPolicy {
-    pub const HALF_LIVES: [f64; 3] = [0.10, 0.35, 0.80];
+    pub const ATTACK_HALF_LIVES: [f64; 3] = [0.025, 0.050, 0.090];
+    pub const RELEASE_HALF_LIVES: [f64; 3] = [0.24, 0.72, 1.65];
 
     pub fn invalidate(&mut self) { self.valid = false; }
 
@@ -90,7 +92,12 @@ impl RetinaHistoryPolicy {
         delta: f64,
         half_life: f64,
     ) -> f64 {
-        -(-std::f64::consts::LN_2 * delta.max(0.0) / half_life).exp_m1()
+        let delta = if delta.is_finite() {
+            delta.max(0.0)
+        } else {
+            0.0
+        };
+        -(-std::f64::consts::LN_2 * delta / half_life).exp_m1()
     }
 
     pub fn extent(
@@ -110,25 +117,30 @@ impl RetinaHistoryPolicy {
         delta: f64,
         held: bool,
     ) -> RetinaHistoryStep {
-        let gap = !held && delta > 0.25;
-        if gap {
-            self.valid = false;
-        }
-        let active_delta = if held || gap { 0.0 } else { delta.max(0.0) };
+        // Hidden/held time is excluded by the host. Slow active frames must
+        // integrate their elapsed time, rather than abruptly erase the trails.
+        let active_delta = if held || !delta.is_finite() {
+            0.0
+        } else {
+            delta.max(0.0)
+        };
         self.time += active_delta;
         let seed = !self.valid;
         let update = seed || active_delta > 0.0;
-        let alphas = if seed {
-            [1.0; 3]
-        } else {
-            Self::HALF_LIVES.map(|half_life| Self::alpha(active_delta, half_life) as f32)
+        let coefficients = |half_lives: [f64; 3]| {
+            if seed {
+                [1.0; 3]
+            } else {
+                half_lives.map(|half_life| Self::alpha(active_delta, half_life) as f32)
+            }
         };
         if update {
             self.valid = true;
         }
         RetinaHistoryStep {
             time: self.time as f32,
-            alphas,
+            attack_alphas: coefficients(Self::ATTACK_HALF_LIVES),
+            release_alphas: coefficients(Self::RELEASE_HALF_LIVES),
             update,
             seed,
         }
@@ -309,8 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn retinal_history_matches_native_half_lives_hold_reset_gap_and_memory_budget() {
-        for half_life in RetinaHistoryPolicy::HALF_LIVES {
+    fn retinal_history_matches_native_attack_release_hold_slow_frames_and_memory_budget() {
+        for half_life in RetinaHistoryPolicy::ATTACK_HALF_LIVES
+            .into_iter()
+            .chain(RetinaHistoryPolicy::RELEASE_HALF_LIVES)
+        {
             for fps in [30, 60, 120] {
                 let delta = 1.0 / f64::from(fps);
                 let mut value = 0.0;
@@ -322,9 +337,16 @@ mod tests {
         }
         let mut retina = RetinaHistoryPolicy::default();
         let seed = retina.advance(1.0 / 60.0, false);
-        assert!(seed.update && seed.seed && seed.alphas == [1.0; 3]);
+        assert!(
+            seed.update
+                && seed.seed
+                && seed.attack_alphas == [1.0; 3]
+                && seed.release_alphas == [1.0; 3]
+        );
         let active = retina.advance(0.02, false);
         assert!(active.update && !active.seed);
+        assert!(retina.advance(0.05, false).attack_alphas[2] > 0.30);
+        let active = retina.advance(0.0, false);
         for delta in [0.016, 0.2, 40.0] {
             let held = retina.advance(delta, true);
             assert!(!held.update && held.time == active.time && !held.seed);
@@ -333,8 +355,14 @@ mod tests {
         let reset = retina.advance(10.0, true);
         assert!(reset.seed && reset.update && reset.time == active.time);
         let gap = retina.advance(1.0, false);
-        assert!(gap.seed && gap.update && gap.time == active.time);
+        assert!(!gap.seed && gap.update && (gap.time - active.time - 1.0).abs() < 1e-6);
         assert!(!retina.advance(0.0, false).update);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            let ignored = retina.advance(invalid, false);
+            assert!(!ignored.update && ignored.time == gap.time);
+            assert_eq!(ignored.attack_alphas, [0.0; 3]);
+            assert_eq!(ignored.release_alphas, [0.0; 3]);
+        }
         let wide = RetinaHistoryPolicy::extent(8192, 4096);
         assert!(wide.width * wide.height <= 350_000);
         assert!((f64::from(wide.width) / f64::from(wide.height) - 2.0).abs() < 0.01);

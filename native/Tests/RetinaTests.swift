@@ -216,31 +216,107 @@ private struct RetinaFailure: Error, CustomStringConvertible { let description: 
         checks.append("Actual linear spectral PSF preserves each channel integral and spreads red > green > blue")
 
         let reservoirPipeline = try device.makeComputePipelineState(function:library.makeFunction(name:"retinaHistoryUpdate")!)
-        let incoming = try texture(device,width:1,height:1,color:SIMD4(0.9,0.1,0.7,1))
-        func update(_ prior: MTLTexture, _ result: MTLTexture, alpha: Float, valid: Float) throws {
+        struct UpdateParameters { var attack: SIMD4<Float>; var release: SIMD4<Float> }
+        func layers(_ w: Int = 4, _ h: Int = 4, color: SIMD4<Float> = .zero) throws -> [MTLTexture] {
+            try (0..<3).map { _ in try texture(device,width:w,height:h,color:color) }
+        }
+        func update(_ current: MTLTexture, _ prior: [MTLTexture], _ result: [MTLTexture],
+                    attack: SIMD3<Float>, release: SIMD3<Float>, valid: Bool) throws {
             let c = queue.makeCommandBuffer()!, e = c.makeComputeCommandEncoder()!
-            var state = SIMD4(alpha,valid,0,0)
-            e.setComputePipelineState(reservoirPipeline); e.setBytes(&state,length:16,index:0)
-            e.setTexture(incoming,index:0); e.setTexture(prior,index:1); e.setTexture(result,index:2)
-            e.dispatchThreads(MTLSize(width:result.width,height:result.height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
+            var state = UpdateParameters(attack:SIMD4(attack,valid ? 1 : 0),release:SIMD4(release,0))
+            e.setComputePipelineState(reservoirPipeline)
+            e.setBytes(&state,length:MemoryLayout<UpdateParameters>.stride,index:0)
+            e.setTexture(current,index:0)
+            for layer in 0..<3 { e.setTexture(prior[layer],index:layer+1); e.setTexture(result[layer],index:layer+4) }
+            e.dispatchThreads(MTLSize(width:result[0].width,height:result[0].height,depth:1),threadsPerThreadgroup:MTLSize(width:8,height:8,depth:1))
             e.endEncoding(); c.commit(); c.waitUntilCompleted()
-            try require(c.status == .completed,"history GPU update")
+            try require(c.status == .completed,"fused history GPU update: \(String(describing:c.error))")
         }
-        let reset = try texture(device,width:4,height:4)
-        try update(invalid,reset,alpha:0,valid:0)
-        for p in read(reset) { try require(simd_length(p-SIMD4(0.9,0.1,0.7,1)) < 0.000001,"reset reads poisoned old reservoir") }
-        var decayResults = [SIMD4<Float>]()
-        for steps in [12,30] {
-            var prior = try texture(device,width:4,height:4,color:SIMD4(0,0,0,1))
-            var next = try texture(device,width:4,height:4)
-            let alpha = Float(-expm1(-log(2.0)*0.35/Double(steps)/0.35))
-            for _ in 0..<steps { try update(prior,next,alpha:alpha,valid:1); swap(&prior,&next) }
-            let actual = read(prior)[0]
-            try require(simd_length(actual-SIMD4(0.45,0.05,0.35,1)) < 0.000004,"actual GPU history update violates analytic half-life")
-            decayResults.append(actual)
+        let ones = SIMD3<Float>(repeating:1), zeros = SIMD3<Float>.zero
+        let incoming = try texture(device,width:1,height:1,color:SIMD4(0.9,0.1,0.7,1))
+        let poisoned = try layers(color:SIMD4(repeating:Float.nan)), reset = try layers()
+        try update(incoming,poisoned,reset,attack:zeros,release:zeros,valid:false)
+        for layer in reset { for p in read(layer) {
+            try require(simd_length(p-SIMD4(0.9,0.1,0.7,1)) < 0.000001,"reset reads poisoned old reservoir")
+        } }
+        checks.append("Fused three-layer reset never reads poisoned history")
+
+        // Independent double-precision source-pixel overlap reference. Test all
+        // layer outputs, noninteger ratios, large reductions, borders and upsampling.
+        for (sw,sh,dw,dh) in [(16,16,3,3),(17,11,4,3),(32,17,3,2),(8,6,4,3),(3,2,7,5)] {
+            let output = try layers(dw,dh)
+            for sourceIndex in Set([0,1,sw-1,sw,sw*sh/2,sw*sh-1]) {
+                var values = [SIMD4<Float>](repeating:SIMD4(0,0,0,1),count:sw*sh)
+                values[sourceIndex] = SIMD4(1,0.25,0.75,1)
+                let source = try texture(device,width:sw,height:sh,values:values)
+                try update(source,poisoned,output,attack:ones,release:ones,valid:false)
+                let sx = Double(sourceIndex%sw), sy = Double(sourceIndex/sw)
+                let scaleX = Double(sw)/Double(dw), scaleY = Double(sh)/Double(dh)
+                for layer in output {
+                    var flux = SIMD3<Double>.zero
+                    for (i,pixel) in read(layer).enumerated() {
+                        let x0 = Double(i%dw)*scaleX, y0 = Double(i/dw)*scaleY
+                        let weightX = max(0,min(x0+scaleX,sx+1)-max(x0,sx))
+                        let weightY = max(0,min(y0+scaleY,sy+1)-max(y0,sy))
+                        let coverage = weightX*weightY/(scaleX*scaleY)
+                        let expected = SIMD3(coverage,coverage*0.25,coverage*0.75)
+                        let actual = SIMD3(Double(pixel.x),Double(pixel.y),Double(pixel.z))
+                        try require(simd_length(actual-expected) < 0.00001,"retinal footprint differs from exact pixel coverage")
+                        flux += actual*(scaleX*scaleY)
+                    }
+                    try require(simd_length(flux-SIMD3(1,0.25,0.75)) < 0.00003,
+                                "retinal downsample loses phase-dependent highlight flux: \(flux)")
+                }
+            }
         }
-        try require(simd_length(decayResults[0]-decayResults[1]) < 0.000002,"reservoir depends on presentation cadence")
-        checks.append("GPU reservoirs reset without NaN reads and match analytic half-life at two cadences")
+        checks.append("Area restriction preserves impulse flux and exact phase/edge coverage at five ratios, including >10x")
+
+        let attacks: [Double] = [0.025,0.050,0.090], releases: [Double] = [0.24,0.72,1.65]
+        func coefficients(_ dt: Double, _ halfLives: [Double]) -> SIMD3<Float> {
+            SIMD3(Float(-expm1(-log(2)*dt/halfLives[0])),Float(-expm1(-log(2)*dt/halfLives[1])),Float(-expm1(-log(2)*dt/halfLives[2])))
+        }
+        let darkness = try texture(device,width:1,height:1,color:SIMD4(0,0,0,1))
+        let flash = try texture(device,width:1,height:1,color:SIMD4(1,0.25,0.75,1))
+        var cadenceResults = [[SIMD4<Float>]]()
+        for fps in [30,60,120] {
+            var prior = try layers(1,1,color:SIMD4(0,0,0,1)), next = try layers(1,1)
+            let a = coefficients(1/Double(fps),attacks), r = coefficients(1/Double(fps),releases)
+            for _ in 0..<(fps/10) { try update(flash,prior,next,attack:a,release:r,valid:true); swap(&prior,&next) }
+            for (layer,t) in prior.enumerated() {
+                let captured = read(t)[0].x
+                try require(abs(Double(captured)-(1-pow(2,-0.1/attacks[layer]))) < 0.00001,"brief glint attack differs from analytic response")
+                try require(captured > 0.5,"brief glint fails to enter a retinal layer")
+            }
+            for _ in 0..<(fps*9/10) { try update(darkness,prior,next,attack:a,release:r,valid:true); swap(&prior,&next) }
+            let samples = prior.map { read($0)[0] }
+            for (layer,pixel) in samples.enumerated() {
+                let expected = Float((1-pow(2,-0.1/attacks[layer]))*pow(2,-0.9/releases[layer]))
+                try require(simd_length(pixel-SIMD4(expected,expected*0.25,expected*0.75,1)) < 0.00002,
+                            "pulse attack/release changes with display cadence")
+            }
+            cadenceResults.append(samples)
+        }
+        try require(difference(cadenceResults[0],cadenceResults[2]) < 0.00001,"30/120Hz pulse trails diverge")
+        checks.append("Actual fused GPU captures a 100ms colored pulse and preserves its analytic tail at 30/60/120Hz")
+
+        for color in [SIMD4<Float>(0,0,0,1),SIMD4(0.2,0.2,0.2,1),SIMD4(8,8,8,1),SIMD4(1,0,0.8,1)] {
+            let source = try texture(device,width:17,height:11,color:color)
+            let prior = try layers(4,3,color:color), next = try layers(4,3)
+            try update(source,prior,next,attack:coefficients(0.02,attacks),release:coefficients(0.02,releases),valid:true)
+            for layer in next { for pixel in read(layer) {
+                try require(simd_length(pixel-color) < 0.00001,"constant black/neutral/HDR spectrum changes in fused update")
+            } }
+        }
+        let brightNeutral = try texture(device,width:1,height:1,color:SIMD4(1,1,1,1))
+        var neutralPrior = try layers(1,1,color:SIMD4(0,0,0,1)), neutralNext = try layers(1,1)
+        try update(brightNeutral,neutralPrior,neutralNext,attack:coefficients(0.02,attacks),release:coefficients(0.02,releases),valid:true)
+        swap(&neutralPrior,&neutralNext)
+        try update(darkness,neutralPrior,neutralNext,attack:coefficients(0.3,attacks),release:coefficients(0.3,releases),valid:true)
+        for t in neutralNext {
+            let p = read(t)[0]
+            try require(abs(p.x-p.y)+abs(p.y-p.z) < 0.000001,"achromatic flash acquires a temporal tint")
+        }
+        checks.append("Fused histories preserve constant black/neutral HDR/color and use one RGB clock for neutral flashes")
 
         let directory = URL(fileURLWithPath:"native/artifacts/retina-checks")
         try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)

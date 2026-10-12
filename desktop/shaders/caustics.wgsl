@@ -17,7 +17,7 @@ fn causticsMap(@builtin(global_invocation_id) p: vec3u) {
     let u = causticsUniforms;
     if p.x > u.grid.x || p.y > u.grid.x || p.z >= 3u { return; }
     let source = vec2f(p.xy) * (u.domain.x / f32(max(1u, u.grid.x)));
-    let field = causticsField(causticsWater, source, u.domain.x);
+    let field = waterSurface(causticsWater, source, u.domain.x);
     let n = normalize(vec3f(-field.yz, 1.0));
     let l = normalize(u.light.xyz);
     let incidence = dot(n, l);

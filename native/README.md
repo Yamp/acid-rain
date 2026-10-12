@@ -71,13 +71,18 @@ Fresnel reflection, bounded secondary reflections, wavelength-dependent refracti
 pigment and water Beer attenuation, coloured bottom illumination, emissive veins and foam.
 A GPU luminance reduction drives gradual pupil adaptation. The actual R/G/B channels
 drift independently within the configured logical-pixel radius. Three unwarped linear-HDR
-reservoirs add persistence with 0.10, 0.35 and 0.80 second half-lives. Their contribution,
-drift and spatial colour rotation vary continuously on an active display clock, independent
-of simulation speed. A positive, normalized spectral diffraction filter redistributes
-light with a wider red footprint. Colour rotation preserves luminance and leaves neutral
+reservoirs capture rising light with 0.025, 0.050 and 0.090 second half-lives, then release
+it with 0.24, 0.72 and 1.65 second half-lives. A shared RGB response preserves each
+reservoir's neutral colours; bounded history weights total at most 54.4%. One fused GPU
+pass updates all three from the same exact pixel-area average of the current HDR image,
+so small highlights contribute even when history resolution is much lower. Their
+contribution, drift and spatial colour rotation vary continuously on an active display
+clock, independent of simulation speed. A positive, normalized spectral diffraction
+filter redistributes light with a wider red footprint. Colour rotation preserves luminance and leaves neutral
 colours neutral; hue agreement limits muddy mixing of unrelated history.
 HDR colour is tone-mapped once after recombining the channels, with a common channel
-scale to protect saturation. Pause and help freeze the effects and their reservoirs.
+scale to protect saturation. Pause, help and occlusion exclude inactive wall time;
+slow active frames still age the reservoirs instead of erasing them.
 The final sRGB attachment applies the display transfer exactly once.
 
 Quality controls change internal GPU resolution while the final drawable follows Retina
@@ -89,10 +94,12 @@ This is a new GPU implementation of the optics, rather than a pixel-identical po
 terminal renderer. It uses the same depth-averaged/local-surface physics and material world;
 it is not a full 3D Navier–Stokes or volumetric path tracer. Secondary reflections and the
 bottom/volume light integrals are deliberately bounded approximations. Retinal history
-uses six half-resolution ping-pong textures, capped at 350,000 pixels each (16.8 MB total);
-subjective transformations never feed back into this history. The existing `i` control
+uses six ping-pong textures, sized from half the drawable resolution and capped at
+350,000 pixels each (16.8 MB total). Quality changes preserve their dimensions and age;
+a drawable resize or explicit scene discontinuity resets them. Subjective transformations
+never feed back into this history. The existing `i` control
 toggles the separate one-frame blend. The subjective layer is an artistic perception
-effect, not a clinical model of vision or a change to the fluid simulation.
+effect, not a validated biological model of LSD or a change to the fluid simulation.
 Its bottom caustics use a separate bounded GPU forward-flux map; they are driven by
 the actual water surface and wavelength-dependent refraction.
 

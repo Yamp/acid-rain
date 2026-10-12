@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-10-12
+
+### Changed
+- Continuous reconstructed GPU water geometry with matching optical normals and caustics.
+- Footprint-aware highlight integration and rotationally consistent terminal normal filtering.
+- Longer colored afterimages with fast capture, separate decay rates and conserved source-area sampling.
+- Shared batched spectral wave evaluation and exact-time physical-impact profile reuse, retaining the complete wave basis.
+
+### Fixed
+- Highlight reconstruction, bloom motion and edge-energy artifacts.
+- Terminal interpolation stalls when source rendering and delivery exceed the old delay cap.
+- Retinal history being cleared by quality changes or slow active frames.
+
+Numerical accuracy, measurement conditions and remaining model limits are recorded
+in [the validation report](docs/SMOOTH_OPTICS_VALIDATION.md).
+
 ## [0.2.0] - 2026-10-11
 
 ### Added

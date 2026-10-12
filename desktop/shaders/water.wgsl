@@ -23,11 +23,40 @@ struct VertexOut {
 fn field(tex: texture_2d<f32>, metres: vec2f) -> vec4f {
     return sample_clamp2(tex, metres * 0.5 + vec2f(0.5) / vec2f(textureDimensions(tex)));
 }
+// Positive cubic B-spline: four linear taps, no negative lobes or new scene rays.
+// Used for the low-resolution environment; height uses interpolating geometry.
+fn opticalCubicAxis(f: f32) -> vec4f {
+    let a=1.0-f; let f2=f*f; let f3=f2*f;
+    let w=vec4f(a*a*a,3.0*f3-6.0*f2+4.0,-3.0*f3+3.0*f2+3.0*f+1.0,f3)/6.0;
+    let g=vec2f(w.x+w.y,w.z+w.w);
+    return vec4f(w.y/g.x-1.0,w.w/g.y+1.0,g);
+}
+fn opticalCubicTap(tex: texture_2d<f32>, uv: vec2f, repeatU: bool) -> vec4f {
+    if (repeatU) { return sample_repeat2(tex,uv); }
+    return sample_clamp2(tex,uv);
+}
+fn opticalCubicSample(tex: texture_2d<f32>, uv: vec2f, repeatU: bool) -> vec4f {
+    let size=vec2f(textureDimensions(tex));
+    let p=uv*size-vec2f(0.5); let cell=floor(p);
+    let x=opticalCubicAxis(p.x-cell.x); let y=opticalCubicAxis(p.y-cell.y);
+    let lo=(cell+vec2f(x.x,y.x)+vec2f(0.5))/size;
+    let hi=(cell+vec2f(x.y,y.y)+vec2f(0.5))/size;
+    return mix(mix(opticalCubicTap(tex,lo,repeatU),
+                   opticalCubicTap(tex,vec2f(hi.x,lo.y),repeatU),x.w),
+               mix(opticalCubicTap(tex,vec2f(lo.x,hi.y),repeatU),
+                   opticalCubicTap(tex,hi,repeatU),x.w),y.w);
+}
+fn surfaceNormal(water: texture_2d<f32>, metres: vec2f) -> vec3f {
+    let slope=waterSurface(water,metres,2.0).yz;
+    return normalize(vec3f(-slope,1.0));
+}
 fn environment(sky: texture_2d<f32>, incoming: vec3f) -> vec3f {
     let direction = normalize(incoming);
-    let uv = vec2f(atan2(direction.y, direction.x) / (2.0 * PI),
+    var longitude=0.0;
+    if (dot(direction.xy,direction.xy) > 1e-12) { longitude=atan2(direction.y,direction.x); }
+    let uv = vec2f(longitude / (2.0 * PI),
                   acos(clamp(direction.z, -1.0, 1.0)) / PI);
-    return sample_repeat2(sky, uv).rgb;
+    return opticalCubicSample(sky,uv,true).rgb;
 }
 fn pigmentTau(mass: vec3f) -> vec3f {
     let m = max(mass, vec3f(0.0));
@@ -63,9 +92,74 @@ fn heightResidual(water: texture_2d<f32>, eye: vec3f, ray: vec3f, distance: f32)
     let p = eye+ray*distance;
     return p.z-field(water,p.xy).x;
 }
-fn intersectWater(water: texture_2d<f32>, eye: vec3f, ray: vec3f, u: Uniforms) -> vec3f {
+struct WaterIntersection { point: vec3f, slope: vec2f, height: f32, distance: f32 }
+fn refineWaterIntersectionCached(water: texture_2d<f32>, eye: vec3f, ray: vec3f,
+    seed: vec3f, initialPatch: WaterSurfacePatch, bracket: vec2f) -> WaterIntersection {
+    var distance=max(0.0,dot(seed-eye,ray)); var point=eye+ray*distance;
+    var surfacePatch=initialPatch;
+    let cellDistance=1.0/max(length(ray.xy*surfacePatch.scale),1e-5);
+    for (var iteration=0u;iteration<4u;iteration+=1u) {
+        let cell=vec2i(floor(point.xy*surfacePatch.scale));
+        if (any(cell!=surfacePatch.cell)) { surfacePatch=waterSurfacePatch(water,point.xy,2.0); }
+        let surface=waterSurfaceValue(surfacePatch,point.xy);
+        let residual=point.z-surface.x; let derivative=ray.z-dot(surface.yz,ray.xy);
+        if (abs(residual)<1e-7 || abs(derivative)<1e-5) { return WaterIntersection(point,surface.yz,surface.x,distance); }
+        let next=max(0.0,distance-clamp(residual/derivative,-cellDistance,cellDistance));
+        if (next<bracket.x || next>bracket.y) { return WaterIntersection(point,surface.yz,surface.x,distance); }
+        distance=next;
+        point=eye+ray*distance;
+    }
+    // The last update can cross a cell; its gradient must match the final point.
+    if (any(vec2i(floor(point.xy*surfacePatch.scale))!=surfacePatch.cell)) {
+        surfacePatch=waterSurfacePatch(water,point.xy,2.0);
+    }
+    let surface=waterSurfaceValue(surfacePatch,point.xy);
+    return WaterIntersection(point,surface.yz,surface.x,distance);
+}
+fn refineWaterIntersectionData(water: texture_2d<f32>, eye: vec3f, ray: vec3f, seed: vec3f) -> WaterIntersection {
+    let point=eye+ray*max(0.0,dot(seed-eye,ray));
+    return refineWaterIntersectionCached(water,eye,ray,seed,waterSurfacePatch(water,point.xy,2.0),vec2f(0.0,1e30));
+}
+fn cubicWaterBracket(water: texture_2d<f32>, eye: vec3f, ray: vec3f,
+    nearInput: f32, farInput: f32) -> WaterIntersection {
+    var near=nearInput; var far=farInput;
+    let left=eye+ray*near; let right=eye+ray*far;
+    let ls=waterSurface(water,left.xy,2.0); let rs=waterSurface(water,right.xy,2.0);
+    var a=left.z-ls.x; var b=right.z-rs.x;
+    var best=WaterIntersection(right,rs.yz,rs.x,far);
+    if (abs(a)<abs(b)) { best=WaterIntersection(left,ls.yz,ls.x,near); }
+    var error=min(abs(a),abs(b));
+    if (!finite1(a) || !finite1(b) || (a>0.0)==(b>0.0)) { return best; }
+    var surfacePatch=waterSurfacePatch(water,left.xy,2.0);
+    for (var iteration=0u;iteration<28u;iteration+=1u) {
+        if (error<=1e-7) { break; }
+        let middle=0.5*(near+far);
+        if (middle==near || middle==far) { break; }
+        let point=eye+ray*middle;
+        if (any(vec2i(floor(point.xy*surfacePatch.scale))!=surfacePatch.cell)) {
+            surfacePatch=waterSurfacePatch(water,point.xy,2.0);
+        }
+        let surface=waterSurfaceValue(surfacePatch,point.xy);
+        let residual=point.z-surface.x;
+        if (abs(residual)<error) { best=WaterIntersection(point,surface.yz,surface.x,middle); error=abs(residual); }
+        if ((residual>0.0)==(a>0.0)) { near=middle; a=residual; }
+        else { far=middle; b=residual; }
+    }
+    return best;
+}
+fn acceptWaterIntersection(water: texture_2d<f32>, eye: vec3f, ray: vec3f,
+    candidate: WaterIntersection, near: f32, far: f32) -> WaterIntersection {
+    // Preserve the exact computed parameter at converged bracket endpoints.
+    if (abs(candidate.point.z-candidate.height)<=1e-6 && candidate.distance>=near && candidate.distance<=far) { return candidate; }
+    return cubicWaterBracket(water,eye,ray,near,far);
+}
+fn refineWaterIntersection(water: texture_2d<f32>, eye: vec3f, ray: vec3f, seed: vec3f) -> vec3f {
+    return refineWaterIntersectionData(water,eye,ray,seed).point;
+}
+fn intersectWaterData(water: texture_2d<f32>, eye: vec3f, ray: vec3f, u: Uniforms) -> WaterIntersection {
     var near = max(0.0,(u.world.z+0.00001-eye.z)/ray.z);
     var far = (u.world.y-0.00001-eye.z)/ray.z;
+    var bracket=vec2f(near,far);
     var a = heightResidual(water,eye,ray,near);
     var b = heightResidual(water,eye,ray,far);
     for (var i = 0u; i < 12u; i += 1u) {
@@ -74,7 +168,19 @@ fn intersectWater(water: texture_2d<f32>, eye: vec3f, ray: vec3f, u: Uniforms) -
         let value = heightResidual(water,eye,ray,m);
         if (value > 0.0) { near=m; a=value; } else { far=m; b=value; }
     }
-    return eye+ray*mix(near,far,clamp(a/max(a-b,1e-9),0.0,1.0));
+    let seed=eye+ray*mix(near,far,clamp(a/max(a-b,1e-9),0.0,1.0));
+    let seedDistance=max(0.0,dot(seed-eye,ray));
+    let point=eye+ray*seedDistance;
+    let surfacePatch=waterSurfacePatch(water,point.xy,2.0);
+    let seedResidual=point.z-waterSurfaceValue(surfacePatch,point.xy).x;
+    if (seedDistance>bracket.x && seedDistance<bracket.y) {
+        if (seedResidual>0.0) { bracket.x=seedDistance; } else { bracket.y=seedDistance; }
+    }
+    let result=refineWaterIntersectionCached(water,eye,ray,seed,surfacePatch,bracket);
+    return acceptWaterIntersection(water,eye,ray,result,bracket.x,bracket.y);
+}
+fn intersectWater(water: texture_2d<f32>, eye: vec3f, ray: vec3f, u: Uniforms) -> vec3f {
+    return intersectWaterData(water,eye,ray,u).point;
 }
 fn extinction(u: Uniforms) -> vec3f {
     return vec3f(1.2,1.6,1.2)*u.optics.y+vec3f(0.015);
@@ -184,22 +290,34 @@ fn bedRadiance(water: texture_2d<f32>, dye: texture_2d<f32>, bed: texture_2d<f32
     }
     return result+cloud.radiance;
 }
-struct SecondaryIntersection { hit: vec3f, found: bool }
+struct SecondaryIntersection { hit: vec3f, found: bool, slope: vec2f }
 fn secondaryHit(water: texture_2d<f32>, start: vec3f, ray: vec3f, u: Uniforms) -> SecondaryIntersection {
-    let miss=SecondaryIntersection(start,false);
-    if (ray.z > 0.45 || (start.z > u.world.z+0.002 && ray.z >= 0.0)) { return miss; }
+    let miss=SecondaryIntersection(start,false,vec2f(0.0));
+    // Upward rays may hit steeper crests; only the height envelope proves a miss.
+    if (start.z > u.world.z+0.002 && ray.z >= 0.0) { return miss; }
     var near=0.001;
     for (var i=1u; i <= 14u; i += 1u) {
         var far=0.001+1.8*f32(i*i)/196.0;
         let p=start+ray*far;
         if (any(p.xy < vec2f(0.0)) || any(p.xy > vec2f(2.0)) ||
             (p.z > u.world.z+0.001 && ray.z > 0.0)) { return miss; }
-        if (p.z < field(water,p.xy).x) {
+        if (p.z < waterSurface(water,p.xy,2.0).x) {
+            let nearPoint=start+ray*near;
+            if (nearPoint.z-waterSurface(water,nearPoint.xy,2.0).x<0.0) {
+                near=0.0;
+                if (start.z-waterSurface(water,start.xy,2.0).x<0.0) { return miss; }
+            }
             for (var k=0u; k < 7u; k += 1u) {
                 let mid=0.5*(near+far);
-                if (heightResidual(water,start,ray,mid) > 0.0) { near=mid; } else { far=mid; }
+                let midPoint=start+ray*mid;
+                if (midPoint.z-waterSurface(water,midPoint.xy,2.0).x > 0.0) { near=mid; } else { far=mid; }
             }
-            return SecondaryIntersection(start+ray*(0.5*(near+far)),true);
+            let seed=start+ray*(0.5*(near+far));
+            let point=start+ray*max(0.0,dot(seed-start,ray));
+            let surfacePatch=waterSurfacePatch(water,point.xy,2.0);
+            let candidate=refineWaterIntersectionCached(water,start,ray,seed,surfacePatch,vec2f(near,far));
+            let hit=acceptWaterIntersection(water,start,ray,candidate,near,far);
+            return SecondaryIntersection(hit.point,true,hit.slope);
         }
         near=far;
     }
@@ -218,8 +336,7 @@ fn reflectedRadiance(water: texture_2d<f32>, dye: texture_2d<f32>, bed: texture_
         let intersection=secondaryHit(water,position,direction,u);
         if (!intersection.found) { break; }
         let hit=intersection.hit;
-        let surface=field(water,hit.xy);
-        let n=normalize(vec3f(-surface.yz,1.0));
+        let n=normalize(vec3f(-intersection.slope,1.0));
         let f=fresnel(-dot(direction,n));
         let bedHit=causticsBedHit(water,dye,hit,refract(direction,n,1.0/IOR.y));
         result += throughput*(vec3f(1.0)-f)/(IOR*IOR)*bedRadiance(water,dye,bed,lightField,
@@ -230,18 +347,65 @@ fn reflectedRadiance(water: texture_2d<f32>, dye: texture_2d<f32>, bed: texture_
     }
     return result+throughput*environment(sky,direction);
 }
+fn directHighlight(n: vec3f, view: vec3f, light: vec3f) -> vec3f {
+    if (dot(n,view) <= 0.0 || dot(n,light) <= 0.0) { return vec3f(0.0); }
+    let ndv=max(0.001,dot(n,view)); let ndl=max(0.001,dot(n,light));
+    let halfway=normalize(light+view);
+    let ndh=max(0.0,dot(n,halfway)); let a2=0.0025;
+    let denom=ndh*ndh*(a2-1.0)+1.0;
+    let d=a2/max(PI*denom*denom,1e-8);
+    let smith=2.0*ndv*ndl/max(ndl*sqrt(a2+(1.0-a2)*ndv*ndv)
+        +ndv*sqrt(a2+(1.0-a2)*ndl*ndl),1e-7);
+    return fresnel(dot(view,halfway))*d*smith*0.18/(4.0*ndv);
+}
+fn directHighlightPixel(n: vec3f, view: vec3f, light: vec3f,
+    nx: vec3f, ny: vec3f, vx: vec3f, vy: vec3f) -> vec3f {
+    // Axis-adaptive positive quadrature; four ordinary / at most256 local BRDF
+    // evaluations. Physical alpha stays .05; no additional scene rays.
+    let width=vec2f(length(nx)+0.5*length(vx),length(ny)+0.5*length(vy));
+    let count=vec2u(select(select(select(2u,4u,width.x>0.04),8u,width.x>0.1),16u,width.x>0.2),
+                     select(select(select(2u,4u,width.y>0.04),8u,width.y>0.1),16u,width.y>0.2));
+    let nodes=array<f32,30>(-0.2886751346,0.2886751346,
+        -0.4305681558,-0.1699905218,0.1699905218,0.4305681558,
+        -0.4801449282,-0.3983332387,-0.262766205,-0.0917173212,
+         0.0917173212,0.262766205,0.3983332387,0.4801449282,
+        -0.4947004675,-0.4722875115,-0.4328156012,-0.3777022042,
+        -0.3089381222,-0.2290083888,-0.1408017754,-0.0475062549,
+         0.0475062549,0.1408017754,0.2290083888,0.3089381222,
+         0.3777022042,0.4328156012,0.4722875115,0.4947004675);
+    let weights=array<f32,30>(0.5,0.5,
+        0.1739274226,0.3260725774,0.3260725774,0.1739274226,
+        0.0506142681,0.1111905172,0.1568533229,0.1813418917,
+        0.1813418917,0.1568533229,0.1111905172,0.0506142681,
+        0.0135762297,0.031126762,0.0475792558,0.0623144856,
+        0.0747979944,0.0845782597,0.0913017075,0.0947253052,
+        0.0947253052,0.0913017075,0.0845782597,0.0747979944,
+        0.0623144856,0.0475792558,0.031126762,0.0135762297);
+    let base=count-vec2u(2);
+    var result=vec3f(0.0);
+    for (var y=0u;y<count.y;y+=1u) {
+        for (var x=0u;x<count.x;x+=1u) {
+            let offset=vec2f(nodes[base.x+x],nodes[base.y+y]);
+            result+=directHighlight(normalize(n+nx*offset.x+ny*offset.y),
+                normalize(view+vx*offset.x+vy*offset.y),light)*weights[base.x+x]*weights[base.y+y];
+        }
+    }
+    return result;
+}
 @fragment fn waterFragment(input: VertexOut) -> @location(0) vec4f {
     let u=waterUniforms;
     let screen=vec2f(input.uv.x*2.0-1.0,1.0-input.uv.y*2.0);
     let ray=normalize(u.forward.xyz+screen.x*u.right.w*u.right.xyz+screen.y*u.up.w*u.up.xyz);
-    let point=intersectWater(waterTex,u.eye.xyz,ray,u);
+    let intersection=intersectWaterData(waterTex,u.eye.xyz,ray,u);
+    let point=intersection.point;
     let footprint=max(length(dpdx(point.xy)),length(dpdy(point.xy)));
     let surface=field(waterTex,point.xy);
-    var n=normalize(vec3f(-surface.yz,1.0));
+    var n=normalize(vec3f(-intersection.slope,1.0));
     let view=-ray;
     if (dot(n,view) < 0.001) { n=normalize(n+view*(0.001-dot(n,view))); }
     // All derivatives are evaluated on this unconditional primary path.
     let dx=dpdx(n); let dy=dpdy(n);
+    let vx=dpdx(view); let vy=dpdy(view);
     let centralHit=causticsBedHit(waterTex,dyeTex,point,refract(ray,n,1.0/IOR.y));
     let centralLocation=bedLocation(point,centralHit);
     let bedFootprint=max(footprint,max(length(dpdx(centralLocation)),length(dpdy(centralLocation))));
@@ -259,15 +423,8 @@ fn reflectedRadiance(water: texture_2d<f32>, dye: texture_2d<f32>, bed: texture_
     let transmitted=bedRadiance(waterTex,dyeTex,bedTex,bedLightTex,cloudTex,skyTex,
         causticsTex,point,n,ray,u,bedWorld,bedFootprint,hydraulicNormal,centralHit,cloudSteps);
     let l=normalize(u.light.xyz);
-    let halfVector=normalize(l+view);
-    let ndl=max(0.001,dot(n,l));
-    let ndh=max(0.0,dot(n,halfVector));
-    let a2=clamp(0.0025+0.5*(dot(dx,dx)+dot(dy,dy)),0.0025,0.25);
-    let denom=ndh*ndh*(a2-1.0)+1.0;
-    let d=a2/max(PI*denom*denom,1e-8);
-    let smith=2.0*ndv*ndl/max(ndl*sqrt(a2+(1.0-a2)*ndv*ndv)+ndv*sqrt(a2+(1.0-a2)*ndl*ndl),1e-7);
     let emitter=environment(skyTex,l);
-    let specular=fresnel(dot(view,halfVector))*emitter*d*smith*0.18/(4.0*ndv);
+    let specular=emitter*directHighlightPixel(n,view,l,dx,dy,vx,vy);
     var radiance=f*reflected+specular+(vec3f(1.0)-f)*transmitted/(IOR*IOR);
     let foam=clamp(surface.w,0.0,1.0);
     let foamLight=cloudIllumination(u)*exp(-pigmentTau(cloudSample(cloudTex,point-vec3f(0.0,0.0,0.02)))*0.02);

@@ -106,16 +106,29 @@ pub fn surface_point(
     if ray[2] >= -0.0001 {
         return None;
     }
+    let cubic = |h: [f32; 4], t: f32| {
+        // Identical to waterCubicCoefficients in the shared surface shader.
+        let a = 0.5 * (-h[0] + 3.0 * h[1] - 3.0 * h[2] + h[3]);
+        let b = h[0] - 2.5 * h[1] + 2.0 * h[2] - 0.5 * h[3];
+        let c = 0.5 * (h[2] - h[0]);
+        ((a * t + b) * t + c) * t + h[1]
+    };
     let residual = |distance: f32| {
         let point: [f32; 3] = std::array::from_fn(|i| eye[i] + ray[i] * distance);
-        let x = (point[0] * 0.5 * width as f32).clamp(0.0, (width - 1) as f32);
-        let y = (point[1] * 0.5 * height as f32).clamp(0.0, (height - 1) as f32);
-        let (ix, iy) = (x as usize, y as usize);
-        let (jx, jy) = ((ix + 1).min(width - 1), (iy + 1).min(height - 1));
+        let x = point[0] * 0.5 * width as f32;
+        let y = point[1] * 0.5 * height as f32;
+        // Floor the unbounded lattice coordinate; clamp ghost samples only.
+        let (ix, iy) = (x.floor() as isize, y.floor() as isize);
         let (fx, fy) = (x - ix as f32, y - iy as f32);
-        let a = water[(iy * width + ix) * 4] * (1.0 - fx) + water[(iy * width + jx) * 4] * fx;
-        let b = water[(jy * width + ix) * 4] * (1.0 - fx) + water[(jy * width + jx) * 4] * fx;
-        point[2] - (a * (1.0 - fy) + b * fy)
+        let rows = std::array::from_fn(|row| {
+            let sy = (iy + row as isize - 1).clamp(0, height as isize - 1) as usize;
+            let samples = std::array::from_fn(|column| {
+                let sx = (ix + column as isize - 1).clamp(0, width as isize - 1) as usize;
+                water[(sy * width + sx) * 4]
+            });
+            cubic(samples, fx)
+        });
+        point[2] - cubic(rows, fy)
     };
     let mut near = ((uniforms.world.0[2] + 0.00001 - eye[2]) / ray[2]).max(0.0);
     let mut far = (uniforms.world.0[1] - 0.00001 - eye[2]) / ray[2];
@@ -331,6 +344,42 @@ mod tests {
             }
         }
         assert_eq!(intersections, 223_200);
+    }
+
+    #[test]
+    fn picking_matches_cubic_crests_and_clamped_ghost_samples_on_both_axes() {
+        // The tilted axis reveals hit height; the profile axis stays fixed.
+        let fixtures = [
+            ([0.0, 0.08, 0.08, 0.0], 0.75, 0.09),
+            ([0.08, 0.0, 0.0, 0.0], 0.125, 0.06375),
+            ([0.0, 0.0, 0.0, 0.08], 1.625, 0.085625),
+        ];
+        for axis in 0..2 {
+            for (profile, coordinate, height) in fixtures {
+                let mut u = ARUniforms {
+                    eye: Float4([0.25, 0.25, 1.0, 1.0]),
+                    forward: Float4([0.0, 0.0, -1.0, 0.0]),
+                    world: Float4([0.0, -0.12, 0.12, 0.0]),
+                    ..ARUniforms::default()
+                };
+                u.eye.0[axis] = coordinate;
+                u.forward.0[1 - axis] = 0.5;
+                let mut water = vec![0.0; 4 * 4 * 4];
+                for y in 0..4 {
+                    for x in 0..4 {
+                        water[(y * 4 + x) * 4] = profile[if axis == 0 { x } else { y }];
+                    }
+                }
+                let point = surface_point([0.5; 2], &u, &water, 4, 4).unwrap();
+                let expected = 0.25 + 0.5 * (1.0 - height);
+                assert!((point[axis] - coordinate).abs() < 0.00001);
+                assert!(
+                    (point[1 - axis] - expected).abs() < 0.00001,
+                    "axis {axis}, coordinate {coordinate}: got {}, expected {expected}",
+                    point[1 - axis]
+                );
+            }
+        }
     }
 
     #[test]

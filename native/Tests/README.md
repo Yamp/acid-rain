@@ -65,6 +65,22 @@ native/artifacts/shader-checks/shader-tests
 
 These save and print `native/artifacts/shader-checks/report.{json,md}` with the GPU name and exact shader hash. They check dielectric Fresnel against independent equations, pigment extinction, HDR tone mapping and color ratios, lattice alignment, flat-surface intersection, actual postprocessing of constant and spatially varying RGB, sRGB attachment encoding, and unlit dyed water's passive black limit. No offline Metal compiler, Rust build, or visible window is required. The tests append test-only GPU entry points in memory; they do not edit the production shader.
 
+The geometry and highlight sampling contracts additionally execute the production
+surface and BRDF functions against independent polynomial and dense pixel-area
+references:
+
+```sh
+mkdir -p native/artifacts/optical-sampling
+xcrun swiftc -parse-as-library -import-objc-header native/include/AcidRainCore.h \
+  native/Tests/OpticalSamplingTests.swift -o native/artifacts/optical-sampling/tests
+native/artifacts/optical-sampling/tests native/artifacts/optical-sampling
+```
+
+They cover mixed curvature, interpolation at wave nodes, geometric derivatives,
+ray residuals, cubic crests, glint energy and subpixel phase. These quantify a finite
+reconstruction and integration scheme; they do not establish an exact continuum
+fluid or unrestricted path tracer.
+
 The subjective layer has a separate actual-GPU suite:
 
 ```sh

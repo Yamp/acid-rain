@@ -3,6 +3,12 @@ use std::f32::consts::{
     TAU,
 };
 
+use ndarray::{
+    Array2,
+    ArrayView2,
+    linalg::general_mat_mul,
+    s,
+};
 use once_cell::sync::Lazy;
 
 use crate::physics::{
@@ -16,6 +22,19 @@ const RADIAL_SAMPLES: usize = 768;
 const SPECTRAL_BINS: usize = 384;
 const MAX_K: f32 = 192.0;
 const DK: f32 = MAX_K / SPECTRAL_BINS as f32;
+
+#[cfg(test)]
+thread_local! {
+    static PROFILE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn profile_build_count() -> usize { PROFILE_BUILDS.with(std::cell::Cell::get) }
+
+#[cfg(test)]
+fn record_profile_builds(count: usize) {
+    PROFILE_BUILDS.with(|builds| builds.set(builds.get() + count));
+}
 
 /// Instantaneous Gaussian pressure impulse on a locally planar water surface.
 /// The integral of pressure over area and time is the sphere's normal momentum.
@@ -216,12 +235,14 @@ fn coefficients(
 /// Spectral Green response to an impact, in meters. Sampling coordinates remain
 /// normalized to the square patch. Phase and group propagation both follow the
 /// dispersion relation; there is no independent carrier/envelope speed.
+#[derive(Debug)]
 pub(crate) struct RadialWave {
     pub radius: f32,
     samples: [f32; RADIAL_SAMPLES + 1],
 }
 
 impl RadialWave {
+    #[cfg(test)]
     pub fn for_grid(
         strength: f32,
         age: f32,
@@ -234,6 +255,7 @@ impl RadialWave {
 
     /// `size` scales the impact diameter, independently of momentum strength.
     /// Finite positive sizes are bounded to 0.25..=3; invalid sizes are rejected.
+    #[cfg(test)]
     pub fn for_grid_sized(
         strength: f32,
         size: f32,
@@ -246,6 +268,7 @@ impl RadialWave {
         Self::from_coefficients(weights)
     }
 
+    #[cfg(test)]
     pub fn for_pressure_impact(
         impact: PressureImpact,
         age: f32,
@@ -256,7 +279,95 @@ impl RadialWave {
         Self::from_coefficients(impact.coefficients(age, lifetime, width, height)?)
     }
 
+    pub fn for_pressure_impacts(
+        impacts: &[(PressureImpact, f32)],
+        lifetime: f32,
+        width: usize,
+        height: usize,
+    ) -> Vec<Option<Self>> {
+        Self::from_coefficient_rows(
+            impacts
+                .iter()
+                .map(|&(impact, age)| impact.coefficients(age, lifetime, width, height)),
+        )
+    }
+
+    pub fn for_grid_waves(
+        waves: &[(f32, f32, f32)],
+        lifetime: f32,
+        width: usize,
+        height: usize,
+    ) -> Vec<Option<Self>> {
+        Self::from_coefficient_rows(waves.iter().map(|&(strength, size, age)| {
+            coefficients(strength, size, age, lifetime, width, height)
+        }))
+    }
+
+    /// Project independent responses through the same fixed Hankel basis. Only
+    /// identically zero high modes are omitted; every nonzero coefficient and
+    /// all 769 radial nodes remain. Small batches keep the scalar reduction.
+    fn from_coefficient_rows(
+        rows: impl ExactSizeIterator<Item = Option<[f32; SPECTRAL_BINS]>>
+    ) -> Vec<Option<Self>> {
+        let mut result: Vec<_> = (0..rows.len()).map(|_| None).collect();
+        let mut weights = Vec::new();
+        let mut indices = Vec::new();
+        let mut active = 0;
+        for (index, row) in rows.enumerate() {
+            let Some(row) = row else {
+                continue;
+            };
+            let Some(last) = row.iter().rposition(|value| *value != 0.0) else {
+                // Match scalar attempted-build accounting for an underflowed
+                // physical impulse, while returning the same absent profile.
+                #[cfg(test)]
+                record_profile_builds(1);
+                continue;
+            };
+            active = active.max(last + 1);
+            weights.push(row);
+            indices.push(index);
+        }
+        if weights.len() < 4 {
+            for (weights, index) in weights.into_iter().zip(indices) {
+                result[index] = Self::from_coefficients(weights);
+            }
+            return result;
+        }
+
+        #[cfg(test)]
+        record_profile_builds(weights.len());
+
+        let weights = ArrayView2::from_shape(
+            (weights.len(), SPECTRAL_BINS),
+            weights.as_slice().as_flattened(),
+        )
+        .expect("coefficient rows have a fixed spectral width");
+        let basis = ArrayView2::from_shape(
+            (RADIAL_SAMPLES + 1, SPECTRAL_BINS),
+            RADIAL_BASIS.as_slice().as_flattened(),
+        )
+        .expect("the fixed Hankel basis is rectangular");
+        let weights = weights.slice(s![.., ..active]);
+        let basis = basis.slice(s![.., ..active]);
+        let mut profiles = Array2::zeros((indices.len(), RADIAL_SAMPLES + 1));
+        // ndarray's existing matrixmultiply backend packs these strided views
+        // and selects its portable SIMD kernel. No BLAS dependency or threads.
+        general_mat_mul(1.0, &weights, &basis.t(), 0.0, &mut profiles);
+        for (row, index) in profiles.rows().into_iter().zip(indices) {
+            let mut samples = [0.0; RADIAL_SAMPLES + 1];
+            samples.copy_from_slice(row.as_slice().expect("output rows are contiguous"));
+            result[index] = Some(Self {
+                radius: SQRT_2,
+                samples,
+            });
+        }
+        result
+    }
+
     fn from_coefficients(weights: [f32; SPECTRAL_BINS]) -> Option<Self> {
+        #[cfg(test)]
+        record_profile_builds(1);
         // Band-limited coefficients above this mode are exactly zero. Four
         // independent accumulators let native SIMD evaluate the retained sum;
         // no mode, physical term or sampling resolution is approximated away.
@@ -301,6 +412,236 @@ impl RadialWave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference sums the unchanged f32 coefficients/basis in f64. The
+    /// forward-error bound uses gamma_(2K), covering separate f32 products and
+    /// additions; it remains meaningful at cancellation nodes where relative
+    /// error against the signed answer would be unbounded.
+    fn assert_batch_projection(
+        weights: Vec<Option<[f32; SPECTRAL_BINS]>>,
+        actual: Vec<Option<RadialWave>>,
+    ) {
+        assert_eq!(weights.len(), actual.len());
+        let active_rows = weights
+            .iter()
+            .flatten()
+            .filter(|row| row.iter().any(|v| *v != 0.0))
+            .count();
+        let unit_roundoff = f64::from(f32::EPSILON) * 0.5;
+        let gamma = 2.0 * SPECTRAL_BINS as f64 * unit_roundoff
+            / (1.0 - 2.0 * SPECTRAL_BINS as f64 * unit_roundoff);
+        for (input, (weights, actual)) in weights.into_iter().zip(actual).enumerate() {
+            let scalar = weights.and_then(RadialWave::from_coefficients);
+            assert_eq!(actual.is_some(), scalar.is_some(), "input {input}");
+            let (Some(weights), Some(actual), Some(scalar)) = (weights, actual, scalar) else {
+                continue;
+            };
+            assert_eq!(actual.radius.to_bits(), scalar.radius.to_bits());
+            for radial in (0..=RADIAL_SAMPLES)
+                .step_by(if active_rows <= 5 { 1 } else { 19 })
+                .chain([RADIAL_SAMPLES])
+            {
+                let (reference, absolute_sum) = weights
+                    .iter()
+                    .zip(RADIAL_BASIS[radial].iter())
+                    .fold((0.0_f64, 0.0_f64), |(sum, absolute), (&weight, &basis)| {
+                        let term = f64::from(weight) * f64::from(basis);
+                        (sum + term, absolute + term.abs())
+                    });
+                let bound = gamma * absolute_sum + 1e-12;
+                let value = f64::from(actual.samples[radial]);
+                assert!(
+                    (value - reference).abs() <= bound,
+                    "input={input} radial={radial}: actual={value} reference={reference} \
+                     bound={bound}"
+                );
+                assert!((value - f64::from(scalar.samples[radial])).abs() <= 2.0 * bound);
+                if active_rows < 4 {
+                    assert_eq!(
+                        actual.samples[radial].to_bits(),
+                        scalar.samples[radial].to_bits()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_pressure_profiles_preserve_scalar_physics_and_input_order() {
+        let sources: Vec<_> = (0..128)
+            .map(|i| {
+                let radius = [0.001375, 0.00825, 0.0165][i % 3];
+                let speed = [0.05, 2.9, 5.8][i % 3];
+                let depth = [0.0001, 0.02, 0.15, 0.7, 3.0][i % 5];
+                let age = [0.0001, 0.003, 0.04, 0.5, 3.0, 9.999, 0.0, f32::NAN, 10.0][i % 9];
+                (PressureImpact::new(radius, speed, depth).unwrap(), age)
+            })
+            .collect();
+        for (width, height) in [(192, 128), (61, 97), (480, 320)] {
+            for count in [0, 1, 3, 4, 5, 32, 128] {
+                let inputs = &sources[..count];
+                let weights = inputs
+                    .iter()
+                    .map(|&(impact, age)| impact.coefficients(age, 10.0, width, height))
+                    .collect();
+                assert_batch_projection(
+                    weights,
+                    RadialWave::for_pressure_impacts(inputs, 10.0, width, height),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_terminal_profiles_keep_size_filtering_and_invalid_entries() {
+        let inputs: Vec<_> = (0..128)
+            .map(|i| {
+                let strength = [0.03, 0.3, 1.5, -1.0, f32::NAN][i % 5];
+                let size = [0.25, 1.0, 1.5, 3.0, 4.0, 0.0, f32::INFINITY][i % 7];
+                let age = [0.0001, 0.1, 0.6, 3.0, 9.999, 0.0, -1.0, 10.0][i % 8];
+                (strength, size, age)
+            })
+            .collect();
+        for (width, height) in [(192, 128), (37, 91), (480, 320)] {
+            for count in [0, 1, 3, 4, 5, 32, 128] {
+                let inputs = &inputs[..count];
+                let weights = inputs
+                    .iter()
+                    .map(|&(strength, size, age)| {
+                        coefficients(strength, size, age, 10.0, width, height)
+                    })
+                    .collect();
+                assert_batch_projection(
+                    weights,
+                    RadialWave::for_grid_waves(inputs, 10.0, width, height),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_profiles_reject_invalid_lifetimes_and_unresolved_grids() {
+        let source = PressureImpact::new(0.00825, 2.9, 0.7).unwrap();
+        for lifetime in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                RadialWave::for_pressure_impacts(&[(source, 0.1); 5], lifetime, 192, 128)
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(
+                RadialWave::for_grid_waves(&[(0.3, 1.5, 0.1); 5], lifetime, 192, 128)
+                    .iter()
+                    .all(Option::is_none)
+            );
+        }
+        for (width, height) in [(0, 128), (192, 0), (1, 128), (192, 1)] {
+            assert!(
+                RadialWave::for_pressure_impacts(&[(source, 0.1); 5], 10.0, width, height)
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(
+                RadialWave::for_grid_waves(&[(0.3, 1.5, 0.1); 5], 10.0, width, height)
+                    .iter()
+                    .all(Option::is_none)
+            );
+        }
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(PressureImpact::new(bad, 2.9, 0.7).is_none());
+            assert!(PressureImpact::new(0.00825, bad, 0.7).is_none());
+            assert!(PressureImpact::new(0.00825, 2.9, bad).is_none());
+        }
+    }
+
+    #[test]
+    fn batch_counter_counts_profiles_not_batches_or_invalid_inputs() {
+        let source = PressureImpact::new(0.00825, 2.9, 0.7).unwrap();
+        let before = profile_build_count();
+        let _ = RadialWave::for_pressure_impacts(&[(source, 0.1); 5], 10.0, 192, 128);
+        assert_eq!(profile_build_count() - before, 5);
+        let _ = RadialWave::for_grid_waves(&[(0.3, 1.0, 0.1); 3], 10.0, 192, 128);
+        assert_eq!(profile_build_count() - before, 8);
+        let _ = RadialWave::for_pressure_impacts(&[(source, 0.0); 5], 10.0, 192, 128);
+        assert_eq!(profile_build_count() - before, 8);
+    }
+
+    #[test]
+    #[ignore]
+    fn batched_hankel_builder_benchmark() {
+        use std::{
+            hint::black_box,
+            time::Instant,
+        };
+        let path = std::env::var("AR_WAVE_BATCH_BENCHMARK")
+            .expect("provide AR_WAVE_BATCH_BENCHMARK for the saved Markdown table");
+        let mut table = String::from(
+            "| Model | Sources | Scalar batch ms | Batched ms | Speedup \
+             |\n|---|---:|---:|---:|---:|\n",
+        );
+        for physical in [false, true] {
+            for count in [1, 4, 32, 128] {
+                let pressure: Vec<_> = (0..count)
+                    .map(|i| {
+                        (
+                            PressureImpact::new(0.00825, 2.9, 0.7).unwrap(),
+                            0.01 + i as f32 * 0.025,
+                        )
+                    })
+                    .collect();
+                let terminal: Vec<_> = pressure.iter().map(|&(_, age)| (0.2, 1.5, age)).collect();
+                let build = |batched| -> Vec<Option<RadialWave>> {
+                    if physical {
+                        if batched {
+                            RadialWave::for_pressure_impacts(&pressure, 10.0, 192, 128)
+                        } else {
+                            pressure
+                                .iter()
+                                .map(|&(source, age)| {
+                                    RadialWave::for_pressure_impact(source, age, 10.0, 192, 128)
+                                })
+                                .collect()
+                        }
+                    } else if batched {
+                        RadialWave::for_grid_waves(&terminal, 10.0, 192, 128)
+                    } else {
+                        terminal
+                            .iter()
+                            .map(|&(strength, size, age)| {
+                                RadialWave::for_grid_sized(strength, size, age, 10.0, 192, 128)
+                            })
+                            .collect()
+                    }
+                };
+                // Exclude shared basis initialization and backend cold-start.
+                black_box(build(false));
+                black_box(build(true));
+                let mut milliseconds = [0.0; 2];
+                const REPETITIONS: usize = 30;
+                for repetition in 0..REPETITIONS {
+                    // Alternate ordering to reduce bias from temperature/clock drift.
+                    for index in [repetition % 2, 1 - repetition % 2] {
+                        let started = Instant::now();
+                        black_box(build(index == 1));
+                        milliseconds[index] += started.elapsed().as_secs_f64() * 1000.0;
+                    }
+                }
+                let [scalar, batched] = milliseconds.map(|sum| sum / REPETITIONS as f64);
+                table.push_str(&format!(
+                    "| {} | {count} | {scalar:.6} | {batched:.6} | {:.3}x |\n",
+                    if physical { "pressure" } else { "terminal" },
+                    scalar / batched,
+                ));
+            }
+        }
+        if let Some(parent) = std::path::Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, &table).unwrap();
+        println!("{table}");
+    }
 
     #[test]
     fn physical_pressure_impulse_has_the_sphere_momentum_and_bounded_energy() {

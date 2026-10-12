@@ -1,13 +1,15 @@
 //! Three scales of artistic ocular persistence, in linear light. Reservoirs
-//! follow the unwarped input independently; only their displayed echoes drift
+//! capture brief light quickly and release it slowly, following unwarped input;
+//! only their displayed echoes drift
 //! within a bounded pixel radius. This avoids feedback blur and leaves water dynamics alone.
 //! Current RGB channels sample independent moving coordinates before display
 //! mapping. A normalized finite-aperture PSF redistributes linear HDR light.
 //! Chroma adaptation preserves luminance; neutral histories cannot bleach dyes.
 
 const LAYERS: usize = 3;
-const LAYER_WEIGHTS: [f32; LAYERS] = [0.10, 0.105, 0.075];
-const HALF_LIVES: [f32; LAYERS] = [0.10, 0.35, 0.80];
+const LAYER_WEIGHTS: [f32; LAYERS] = [0.12, 0.11, 0.09];
+const ATTACK_HALF_LIVES: [f32; LAYERS] = [0.025, 0.05, 0.09];
+const RELEASE_HALF_LIVES: [f32; LAYERS] = [0.24, 0.72, 1.65];
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 pub const DEFAULT_RGB_SHIFT: f32 = 2.0;
 pub const MAX_RGB_SHIFT: f32 = 12.0;
@@ -469,11 +471,21 @@ impl Retina {
         }
         scratch.resize(pixels.len(), [0.0; 3]);
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
-        // Integrate only raw, unwarped exposed HDR. Fixed achromatic half-lives
-        // keep the age independent of dose, RGB channel and frame cadence.
+        // Integrate only raw, unwarped exposed HDR. A shared luminance-driven
+        // attack/release clock captures brief glints without changing their hue.
+        // Half-lives use wall time and remain independent of dose and cadence.
+        let response = |half_life: f32| -(-std::f32::consts::LN_2 * dt / half_life).exp_m1();
+        let attack_alpha = ATTACK_HALF_LIVES.map(response);
+        let release_alpha = RELEASE_HALF_LIVES.map(response);
         for (layer, history) in self.history.iter_mut().enumerate() {
-            let alpha = -(-std::f32::consts::LN_2 * dt / HALF_LIVES[layer]).exp_m1();
             for (stored, input) in history.iter_mut().zip(pixels.iter()) {
+                let input_luma: f32 = input.iter().zip(LUMA).map(|(c, weight)| c * weight).sum();
+                let stored_luma: f32 = stored.iter().zip(LUMA).map(|(c, weight)| c * weight).sum();
+                let alpha = if input_luma > stored_luma {
+                    attack_alpha[layer]
+                } else {
+                    release_alpha[layer]
+                };
                 for c in 0..3 {
                     stored[c] = if stored[c].is_finite() {
                         stored[c] + (input[c] - stored[c]) * alpha
@@ -587,14 +599,14 @@ mod native_port_regressions {
     }
 
     #[test]
-    fn raw_reservoirs_have_fixed_achromatic_wall_time_half_lives() {
+    fn raw_reservoirs_have_fixed_achromatic_wall_time_release_half_lives() {
         let mut eye = Retina::new();
         let mut pixels = vec![[1.0; 3]];
         let mut scratch = Vec::new();
         eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.0, 0.0), 4.0);
         pixels[0] = [0.0; 3];
         eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.35, 0.35), 4.0);
-        for (layer, half_life) in [0.10_f32, 0.35, 0.80].into_iter().enumerate() {
+        for (layer, half_life) in [0.24_f32, 0.72, 1.65].into_iter().enumerate() {
             let expected = 2.0_f32.powf(-0.35 / half_life);
             for actual in eye.history[layer][0] {
                 assert!(
@@ -696,6 +708,166 @@ mod native_port_regressions {
         eye.apply(&mut pixels, &mut scratch, (3, 3), (3, 3), (173.0, 0.0), 4.0);
         assert_eq!(eye.elapsed, 173.0);
         assert!(pixels.iter().all(|p| *p == [0.0; 3]));
+    }
+}
+
+#[cfg(test)]
+mod pulse_regressions {
+    use super::*;
+
+    #[test]
+    fn a_short_glint_is_captured_before_its_slow_tail_fades() {
+        let mut eye = Retina::new();
+        let mut scratch = Vec::new();
+        let mut pixels = vec![[0.0; 3]];
+        eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.0, 0.0), 4.0);
+        let glint = [4.0, 0.2, 1.0];
+        pixels[0] = glint;
+        eye.apply(
+            &mut pixels,
+            &mut scratch,
+            (1, 1),
+            (1, 1),
+            (1.0 / 60.0, 1.0 / 60.0),
+            4.0,
+        );
+        for (layer, history) in eye.history.iter().enumerate() {
+            let captured = history[0][0] / glint[0];
+            assert!(
+                captured > 0.10,
+                "layer {layer} lost the brief glint: {captured}"
+            );
+        }
+        pixels[0] = [0.0; 3];
+        eye.apply(
+            &mut pixels,
+            &mut scratch,
+            (1, 1),
+            (1, 1),
+            (1.0 + 1.0 / 60.0, 1.0),
+            4.0,
+        );
+        assert!(
+            pixels[0][0] > 0.02,
+            "brief glint left no visible one-second tail: {:?}",
+            pixels[0]
+        );
+        assert!((pixels[0][0] / pixels[0][2] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn attack_and_release_steps_keep_one_shared_rgb_clock() {
+        for (layer, (attack, release)) in [(0.025, 0.24), (0.05, 0.72), (0.09, 1.65)]
+            .into_iter()
+            .enumerate()
+        {
+            for source in [[1.0; 3], [0.8, 0.2, 0.4]] {
+                let mut eye = Retina::new();
+                let mut scratch = Vec::new();
+                let mut pixels = vec![[0.0; 3]];
+                eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.0, 0.0), 4.0);
+                pixels[0] = source;
+                eye.apply(
+                    &mut pixels,
+                    &mut scratch,
+                    (1, 1),
+                    (1, 1),
+                    (attack, attack),
+                    4.0,
+                );
+                for (actual, source) in eye.history[layer][0].into_iter().zip(source) {
+                    assert!(
+                        (actual - source * 0.5).abs() < 1e-6,
+                        "attack layer {layer}: {actual}"
+                    );
+                }
+                pixels[0] = [0.0; 3];
+                eye.apply(
+                    &mut pixels,
+                    &mut scratch,
+                    (1, 1),
+                    (1, 1),
+                    (attack + release, release),
+                    4.0,
+                );
+                for (actual, source) in eye.history[layer][0].into_iter().zip(source) {
+                    assert!(
+                        (actual - source * 0.25).abs() < 1e-6,
+                        "release layer {layer}: {actual}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn pulse_at_cadence(fps: usize) -> (Retina, [f32; 3]) {
+        let mut eye = Retina::new();
+        eye.set_subjective_intensity(2.0);
+        let mut scratch = Vec::new();
+        let mut pixels = vec![[0.0; 3]];
+        eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.0, 0.0), 4.0);
+        // The same 100 ms exposure, followed by 900 ms of darkness at every FPS.
+        // A one-frame pulse would have a different physical duration at each cadence.
+        for frame in 1..=fps {
+            pixels[0] = if frame <= fps / 10 {
+                [2.0, 0.5, 1.0]
+            } else {
+                [0.0; 3]
+            };
+            eye.apply(
+                &mut pixels,
+                &mut scratch,
+                (1, 1),
+                (1, 1),
+                (frame as f32 / fps as f32, 1.0 / fps as f32),
+                4.0,
+            );
+        }
+        (eye, pixels[0])
+    }
+
+    #[test]
+    fn the_same_wall_time_pulse_has_the_same_tail_at_30_60_and_120_hz() {
+        let (reference, reference_output) = pulse_at_cadence(120);
+        assert!(
+            reference_output[0] > 0.06,
+            "pulse was barely retained: {reference_output:?}"
+        );
+        for fps in [30, 60] {
+            let (eye, output) = pulse_at_cadence(fps);
+            for (actual, expected) in eye.history.iter().zip(&reference.history) {
+                for (actual, expected) in actual[0].iter().zip(expected[0]) {
+                    assert!(
+                        (actual - expected).abs() < 2e-6,
+                        "{fps} Hz history: {actual} != {expected}"
+                    );
+                }
+            }
+            for (actual, expected) in output.into_iter().zip(reference_output) {
+                assert!(
+                    (actual - expected).abs() < 2e-6,
+                    "{fps} Hz output: {actual} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dimming_color_change_uses_release_for_every_channel() {
+        let mut eye = Retina::new();
+        let mut scratch = Vec::new();
+        let mut pixels = vec![[0.0, 0.5, 0.0]];
+        eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.0, 0.0), 4.0);
+        // Red rises, but total luminance falls: choosing attack separately for red
+        // would change the hue and leave the segment between the two source colors.
+        pixels[0] = [1.0, 0.0, 0.0];
+        eye.apply(&mut pixels, &mut scratch, (1, 1), (1, 1), (0.24, 0.24), 4.0);
+        assert!((eye.history[0][0][0] - 0.5).abs() < 1e-6);
+        assert!((eye.history[0][0][1] - 0.25).abs() < 1e-6);
+        for history in &eye.history {
+            assert!((history[0][0] + history[0][1] * 2.0 - 1.0).abs() < 1e-6);
+            assert_eq!(history[0][2], 0.0);
+        }
     }
 }
 
@@ -1198,6 +1370,7 @@ mod tests {
         let (w, h) = (23, 13);
         let maximum = [0.31, 0.83, 1.73];
         let mut retina = Retina::new();
+        retina.set_subjective_intensity(2.0);
         let mut pixels = vec![[0.0; 3]; w * h];
         let mut scratch = Vec::new();
         for step in 0..40 {

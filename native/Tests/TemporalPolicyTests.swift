@@ -59,7 +59,12 @@ import Foundation
         }
         precondition(error < 0.02, "The camera must converge back to the slower simulation clock")
 
-        for halfLife in RetinaHistoryPolicy.halfLives {
+        var flashPolicy = RetinaHistoryPolicy()
+        _ = flashPolicy.advance(delta: 0, held: false)
+        let flash = flashPolicy.advance(delta: 0.05, held: false)
+        precondition(flash.attackAlphas.z > 0.30, "A 50 ms glint must visibly enter even the slow retinal layer")
+
+        for halfLife in RetinaHistoryPolicy.attackHalfLives + RetinaHistoryPolicy.releaseHalfLives {
             var results: [Double] = []
             for cadence in [1.0 / 30, 1.0 / 60, 1.0 / 120] {
                 var value = 0.0
@@ -74,7 +79,7 @@ import Foundation
         }
         var retina = RetinaHistoryPolicy()
         let seed = retina.advance(delta: 1.0 / 60, held: false)
-        precondition(seed.update && seed.seed && seed.alphas == SIMD3<Float>(repeating: 1))
+        precondition(seed.update && seed.seed && seed.attackAlphas == SIMD3<Float>(repeating: 1) && seed.releaseAlphas == SIMD3<Float>(repeating: 1))
         let active = retina.advance(delta: 0.02, held: false)
         precondition(active.update && !active.seed)
         let phase = active.time
@@ -86,13 +91,19 @@ import Foundation
         let resetHeld = retina.advance(delta: 10, held: true)
         precondition(resetHeld.seed && resetHeld.update && resetHeld.time == phase)
         let gap = retina.advance(delta: 1, held: false)
-        precondition(gap.seed && gap.update && gap.time == phase,
-            "A hidden-window gap must reset reservoirs instead of integrating stale wall time")
+        precondition(!gap.seed && gap.update && abs(gap.time - phase - 1) < 1e-6,
+            "A slow active frame ages existing reservoirs without reseeding them")
         let empty = retina.advance(delta: 0, held: false)
         precondition(!empty.update)
+        for invalid in [Double.nan,Double.infinity,-1] {
+            let ignored = retina.advance(delta: invalid, held: false)
+            precondition(!ignored.update && ignored.time == empty.time
+                && ignored.attackAlphas == .zero && ignored.releaseAlphas == .zero,
+                "Invalid wall intervals cannot poison time or history coefficients")
+        }
         let wide = RetinaHistoryPolicy.extent(width: 8192, height: 4096)
         precondition(wide.width * wide.height <= 350_000 && abs(Double(wide.width) / Double(wide.height) - 2) < 0.01)
         print("PASS presentation clock: 3 cadences, publication jitter, command republish, hold/resume, speed, bounded stale lead")
-        print("PASS retinal history: exact exponential half-lives, reset/held state, gap handling, bounded memory")
+        print("PASS retinal history: exact exponential half-lives, reset/held state, slow active frames, bounded memory")
     }
 }

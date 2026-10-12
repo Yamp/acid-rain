@@ -6,6 +6,7 @@ import simd
         testStableLens()
         testConservativeFrustum()
         testPresentation()
+        testCubicPicking()
         var cases = 0
         for seconds: Float in [0, 30, 100, 1000, 10000] {
             for aspect: Float in [0.5, 1, 1.6, 3] {
@@ -58,6 +59,37 @@ import simd
         precondition(WaterCamera.surfacePoint(at: SIMD2<Float>(0.5, 0.5), uniforms: picking, water: [], width: width, height: height) == nil)
         print("PASS surface picking: sloping water, center and edge rays, invalid input")
         print("PASS fitted camera: \(cases) poses, rotation, portrait and ultrawide, both height bounds")
+    }
+
+    static func testCubicPicking() {
+        // Keep the ray's crest coordinate fixed and tilt its other axis: the
+        // returned horizontal point then independently reveals the hit height.
+        let fixtures: [([Float], Float, Float)] = [
+            ([0, 0.08, 0.08, 0], 0.75, 0.09),
+            ([0.08, 0, 0, 0], 0.125, 0.06375),
+            ([0, 0, 0, 0.08], 1.625, 0.085625),
+        ]
+        for axis in 0..<2 {
+            for (profile, coordinate, height) in fixtures {
+                var u = ARUniforms()
+                u.eye = SIMD4<Float>(0.25, 0.25, 1, 1)
+                u.eye[axis] = coordinate
+                u.forward = SIMD4<Float>(0, 0, -1, 0)
+                u.forward[1 - axis] = 0.5
+                u.world = SIMD4<Float>(0, -0.12, 0.12, 0)
+                var water = [Float](repeating: 0, count: 4 * 4 * 4)
+                for y in 0..<4 { for x in 0..<4 {
+                    water[(y * 4 + x) * 4] = profile[axis == 0 ? x : y]
+                }}
+                let point = WaterCamera.surfacePoint(at: SIMD2<Float>(0.5, 0.5),
+                    uniforms: u, water: water, width: 4, height: 4)!
+                let expected = 0.25 + 0.5 * (1 - height)
+                precondition(abs(point[axis] - coordinate) < 0.00001)
+                precondition(abs(point[1 - axis] - expected) < 0.00001,
+                    "Cubic picking axis \(axis), coordinate \(coordinate): got \(point[1 - axis]), expected \(expected)")
+            }
+        }
+        print("PASS cubic surface picking: thin crest and clamped ghost samples on both axes")
     }
 
     static func testStableLens() {

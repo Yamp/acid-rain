@@ -251,10 +251,14 @@ impl Pipelines {
             ],
         );
         let retina = compute(device, common, &retina_module, "retinaHistoryUpdate", &[
-            uniform(1, 16),
             sampled(2, d2, true),
-            sampled(3, d2, true),
+            sampled(5, d2, true),
+            sampled(6, d2, true),
+            sampled(7, d2, true),
             image(8, d2, TextureFormat::Rgba16Float),
+            image(9, d2, TextureFormat::Rgba16Float),
+            image(10, d2, TextureFormat::Rgba16Float),
+            uniform(11, 32),
         ]);
         let exposure = compute(device, common, &exposure_module, "adaptExposure", &[
             uniform(0, 208),

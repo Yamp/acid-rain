@@ -14,15 +14,30 @@ enum WaterCamera {
             + SIMD3<Float>(u.right.x, u.right.y, u.right.z) * ((2 * uv.x - 1) * u.right.w)
             + SIMD3<Float>(u.up.x, u.up.y, u.up.z) * ((1 - 2 * uv.y) * u.up.w)
         guard ray.z < -0.0001 else { return nil }
+        func cubic(_ h: SIMD4<Float>, _ t: Float) -> Float {
+            // Same coefficients as waterCubicCoefficients in Caustics.metal.
+            let a = 0.5 * (-h.x + 3 * h.y - 3 * h.z + h.w)
+            let b = h.x - 2.5 * h.y + 2 * h.z - 0.5 * h.w
+            let c = 0.5 * (h.z - h.x)
+            return ((a * t + b) * t + c) * t + h.y
+        }
         func residual(_ distance: Float) -> Float {
             let p = eye + ray * distance
-            let x = max(0, min(Float(width - 1), p.x * 0.5 * Float(width)))
-            let y = max(0, min(Float(height - 1), p.y * 0.5 * Float(height)))
-            let ix = Int(x), iy = Int(y), jx = min(ix + 1, width - 1), jy = min(iy + 1, height - 1)
+            let x = p.x * 0.5 * Float(width), y = p.y * 0.5 * Float(height)
+            // Floor the unbounded lattice coordinate; clamp ghost samples only.
+            let ix = Int(floor(x)), iy = Int(floor(y))
             let fx = x - Float(ix), fy = y - Float(iy)
-            let a = water[(iy * width + ix) * 4] * (1 - fx) + water[(iy * width + jx) * 4] * fx
-            let b = water[(jy * width + ix) * 4] * (1 - fx) + water[(jy * width + jx) * 4] * fx
-            return p.z - (a * (1 - fy) + b * fy)
+            var rows = SIMD4<Float>(repeating: 0)
+            for row in 0..<4 {
+                let sy = max(0, min(height - 1, iy + row - 1))
+                var samples = SIMD4<Float>(repeating: 0)
+                for column in 0..<4 {
+                    let sx = max(0, min(width - 1, ix + column - 1))
+                    samples[column] = water[(sy * width + sx) * 4]
+                }
+                rows[row] = cubic(samples, fx)
+            }
+            return p.z - cubic(rows, fy)
         }
         var near = max(0, (u.world.z + 0.00001 - eye.z) / ray.z)
         var far = (u.world.y - 0.00001 - eye.z) / ray.z

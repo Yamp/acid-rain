@@ -24,6 +24,11 @@ private struct CausticsUniforms {
     var grid = SIMD4<UInt32>(128, 256, 256, 0)
 }
 
+private struct RetinaHistoryUniforms {
+    var attack: SIMD4<Float>
+    var release: SIMD4<Float>
+}
+
 private final class FrameResources {
     let water: MTLTexture
     let dye: MTLTexture
@@ -359,17 +364,26 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
     private func ensureHDR(width: Int, height: Int) throws {
         let wanted = RenderPolicy.extent(width: width, height: height, quality: quality,
                                         automaticPixelBudget: policy.automaticPixelBudget)
-        guard wanted != extent else { return }
-        var next: [MTLTexture] = []
-        for index in 0..<2 {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float,
-                width: wanted.width, height: wanted.height, mipmapped: false)
-            d.storageMode = .private; d.usage = [.renderTarget, .shaderRead]
-            guard let texture = device.makeTexture(descriptor: d) else { throw NativeFailure("Cannot allocate HDR target at \(wanted.width) × \(wanted.height).") }
-            texture.label = "HDR history \(index)"
-            next.append(texture)
+        if wanted != extent {
+            var next: [MTLTexture] = []
+            for index in 0..<2 {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float,
+                    width: wanted.width, height: wanted.height, mipmapped: false)
+                d.storageMode = .private; d.usage = [.renderTarget, .shaderRead]
+                guard let texture = device.makeTexture(descriptor: d) else {
+                    throw NativeFailure("Cannot allocate HDR target at \(wanted.width) × \(wanted.height).")
+                }
+                texture.label = "HDR history \(index)"
+                next.append(texture)
+            }
+            hdr = next; extent = wanted
+            resetHistory(preserveRetina: true)
         }
-        let reservoirExtent = RetinaHistoryPolicy.extent(width: wanted.width, height: wanted.height)
+        // Scene quality may adapt every few frames; retinal memory follows
+        // only the drawable footprint and survives those quality transitions.
+        let reservoirExtent = RetinaHistoryPolicy.extent(width: width, height: height)
+        if let existing = retinaHistories.first?.first,
+           existing.width == reservoirExtent.width && existing.height == reservoirExtent.height { return }
         var reservoirs: [[MTLTexture]] = []
         for generation in 0..<2 {
             var layers: [MTLTexture] = []
@@ -385,7 +399,6 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
             }
             reservoirs.append(layers)
         }
-        hdr = next; extent = wanted
         retinaHistories = reservoirs; retinaIndex = 0
         resetHistory()
     }
@@ -513,22 +526,24 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         let step = retinaPolicy.advance(delta: delta, held: held)
         if step.update {
             let next = 1 - retinaIndex
-            for layer in 0..<3 {
-                guard let encoder = commands.makeComputeCommandEncoder() else {
-                    throw NativeFailure("Cannot encode retinal history.")
-                }
-                var parameters = SIMD4<Float>(step.alphas[layer], step.seed ? 0 : 1, 0, 0)
-                let result = retinaHistories[next][layer]
-                encoder.label = "Time-normalized retinal reservoir \(layer)"
-                encoder.setComputePipelineState(retinaHistoryPipeline)
-                encoder.setBytes(&parameters, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-                encoder.setTexture(current, index: 0)
-                encoder.setTexture(retinaHistories[retinaIndex][layer], index: 1)
-                encoder.setTexture(result, index: 2)
-                encoder.dispatchThreads(MTLSize(width: result.width, height: result.height, depth: 1),
-                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
-                encoder.endEncoding()
+            guard let encoder = commands.makeComputeCommandEncoder() else {
+                throw NativeFailure("Cannot encode retinal history.")
             }
+            var parameters = RetinaHistoryUniforms(
+                attack: SIMD4<Float>(step.attackAlphas, step.seed ? 0 : 1),
+                release: SIMD4<Float>(step.releaseAlphas, 0))
+            let result = retinaHistories[next][0]
+            encoder.label = "Fused time-normalized retinal reservoirs"
+            encoder.setComputePipelineState(retinaHistoryPipeline)
+            encoder.setBytes(&parameters, length: MemoryLayout<RetinaHistoryUniforms>.stride, index: 0)
+            encoder.setTexture(current, index: 0)
+            for layer in 0..<3 {
+                encoder.setTexture(retinaHistories[retinaIndex][layer], index: layer + 1)
+                encoder.setTexture(retinaHistories[next][layer], index: layer + 4)
+            }
+            encoder.dispatchThreads(MTLSize(width: result.width, height: result.height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            encoder.endEncoding()
             retinaIndex = next
         }
         return SIMD4<Float>(step.time, max(0, min(2, subjectiveIntensity)), 1, 0)

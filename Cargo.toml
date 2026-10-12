@@ -1,6 +1,6 @@
 [package]
 name = "acid-rain"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["yampolson <https://github.com/Yamp>"]
 edition = "2024"
 rust-version = "1.88"

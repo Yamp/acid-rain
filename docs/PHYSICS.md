@@ -222,6 +222,23 @@ coverage split. Coverage-weighted surface-velocity backtracking helps temporal
 reconstruction follow transported foam; clear water retains geometric reprojection.
 Mixed pixels still share one history rather than separate optical/material layers.
 
+## Reusing the spectral calculation
+
+All active impacts use the same fixed Hankel basis: 384 spectral modes and 769
+radial nodes. Four or more active profiles are evaluated together as a matrix
+product through the existing portable SIMD backend. Smaller batches retain the
+scalar sum. Only identically zero spectral coefficients are omitted; this changes
+the evaluation order, not the dispersion, damping, pressure spectrum or grid.
+Tests compare the result with independent f64 sums and a floating-point forward
+error bound, including cancellation near wave nodes.
+
+A physical impact caches its radial profile for the exact physical age, lifetime
+and grid dimensions. A same-time refresh after a new contact rebuilds only missing
+profiles. The complete spatial field is still assembled in source order, so source
+eviction, expiry and world recentering cannot leave stale displacement. Advancing
+physical time or changing the grid invalidates the affected profiles. The cache
+does not skip a physics step or change the timing or momentum of a contact.
+
 ## Numerical checks
 
 Tests cover shallow/deep dispersion limits, group-speed derivatives, capillary

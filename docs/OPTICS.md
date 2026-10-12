@@ -74,6 +74,49 @@ Microfacet shading remains at the primary encounter; secondary paths use geometr
 directions. See [PBRT dielectric reflection and transmission](https://www.pbr-book.org/3ed-2018/Reflection_Models/Specular_Reflection_and_Transmission)
 for the transport principles.
 
+### GPU surface reconstruction and highlight integration
+
+Metal and WGPU reconstruct the water height with an interpolating tensor
+Catmull–Rom patch over sixteen height samples. The shading normal is the analytic
+derivative of that same polynomial; forward caustics and native drop contacts use
+the same reconstruction. This retains the height at every lattice node instead
+of smoothing away short resolved waves. The hydraulic bed remains the original
+water-minus-depth field. Contact depth accounts for the reconstructed surface's
+offset from its bilinear height, preserving that bed.
+
+Catmull–Rom can exceed the sampled height range. Each one-dimensional kernel has
+at most 1/8 negative weight mass; the tensor kernel has at most 9/32. Exported
+camera and ray bounds therefore include 9/32 of the full height range on both
+sides, with outward floating-point rounding. Clamped ghost samples define the
+edge continuation. Primary rays use the previous inexpensive intersection as a
+seed and refine against the cubic patch inside a valid cubic bracket. A degenerate
+Newton derivative or residual above one micrometre invokes a bounded, at most
+28-step cubic bisection with floating-point stagnation handling. The original
+global height bracket is retained before the bilinear seed search; the bilinear
+search's narrower interval can exclude the actual cubic surface. The final height,
+normal and ray parameter share the same accepted evaluation. Secondary visibility
+probes also sample cubic height. Finite marching can still miss a closer crest,
+including a grid-resolved crest between probes. Global primary bracketing does
+not prove selection of the nearest root when several crossings exist.
+
+Direct highlights retain the GGX microsurface parameter `alpha = 0.05`, dielectric
+Fresnel and Smith masking. Their pixel-area integral uses positive normalized
+Gauss weights over the local normal and view gradients. Each axis selects 2, 4,
+8 or 16 samples according to its angular footprint: ordinary pixels require four
+BRDF evaluations; extreme two-axis folds use at most 256. These are local BRDF
+evaluations, without extra volume rays. Back-facing light or view contributes zero.
+This avoids expanding a thin ribbon into an unrelated axis just to suppress aliasing.
+The finite quadrature and local linear directional model have measurable error;
+they are not an exact integral for every possible subpixel fold.
+
+Environment magnification alone uses a positive cubic B-spline, evaluated with
+four bilinear fetches following [GPU Gems' third-order filtering](https://developer.nvidia.com/gpugems/gpugems2/part-iii-high-quality-rendering/chapter-20-fast-third-order-texture-filtering).
+It preserves constants and removes derivative kinks, but smooths environment detail;
+it does not replace spherical prefiltering or integrate every reflected footprint.
+The BRDF interpretation follows [PBRT microfacet theory](https://www.pbr-book.org/4ed/Reflection_Models/Roughness_Using_Microfacet_Theory).
+Production GPU tests compare mixed-curvature patches, nodal waves and ray residuals
+with independent references, and moving GGX lobes with dense f64 area integration.
+
 ### Refracted bed and diffuse airlight
 
 Transmission sees a structured bed with neutral diffuse albedo, authored coloured
@@ -174,11 +217,25 @@ water's physical dye field. Scene fog density is now 0.00055–0.001 per metre,
 phase-function integration.
 
 The primary GGX lobe uses an effective unresolved roughness alpha of 0.05.
-Resolved normal variance and the pixel footprint broaden it before shading,
-preserving filtered highlights as the camera moves. This is a microfacet closure,
+Metric Scharr normals and the complete height Hessian, including mixed curvature,
+provide an estimate of the unit-normal gradient. Its squared Frobenius norm times
+`s² / 12` gives angular variance over a square reference footprint of side `s`.
+The actual pixel footprint scales this variance before shading. A smooth saddle
+therefore receives the same filtering when rotated relative to either a square or
+rectangular water grid, and a tilted plane does not acquire geometric roughness.
+The length lost during bilinear direction reconstruction is not counted as another
+roughness contribution: doing so made highlight width pulse between lattice nodes.
+This is a first-order microfacet filtering closure,
 not a measured universal water constant. Compared with the previous 0.12, it
 concentrates the same normalized lobe into more localized glints without increasing
 emitter radiance; the change is visible only where light and view directions align.
+
+High retains four fixed subpixel rays. Balanced and Low use a bounded convex spatial
+edge resolve whose weight changes smoothly across both its absolute and relative
+contrast thresholds; crossing a threshold no longer abruptly darkens a small glint.
+The tests in `term::optical_sampling_regressions` cover saddle rotation, subpixel
+highlight-width continuity and both edge thresholds. This does not replace the
+height-field ray/intersection approximations or introduce a global image blur.
 
 The primary camera uses a roll- and orbit-independent safety cone, rather than
 refitting rotated image corners against each small change in wave height.
@@ -199,7 +256,10 @@ as camera motion. The steady 4-degree-per-scene-second roll and orbit heading
 remain tied to the shared scene clock; terminal rendering does not predict an
 independently published simulation snapshot. Pause and help freeze presentation
 motion. Switching coordinate modes or moving the scene clock backward reseeds
-the presentation state.
+the presentation state. A slow active frame retains that state rather than being
+mistaken for an interruption. Restoring a zero-sized viewport explicitly resets
+stale presentation history and discards the hidden interval on the first visible
+frame; the subjective phase itself is retained.
 
 Exceptional heights expand the envelope immediately, with 2 mm clearance, and
 release it toward the nominal range with a two-second exponential time constant.
@@ -335,35 +395,71 @@ flow velocities or the camera's timing.
 ## Glare and ocular echoes
 
 Bloom extracts all channels with one luminance gate, retaining their ratios.
-It removes the scattered fraction from the source and redistributes it through normalized
-half-resolution Gaussian/glare kernels. Diffraction-shaped horizontal, vertical and diagonal
-taps scale by the RGB representative wavelengths, red being wider than blue.
-Constant colored fields remain unchanged even at frame edges. Edge clamping and radial shafts
-do not establish exact global photon-flux conservation or a full aperture diffraction solver.
+It removes the scattered fraction from the source and redistributes it through
+half-resolution Gaussian/glare kernels. A separable `[1, 3, 3, 1] / 8` prefilter
+precedes decimation, preserving both subpixel phases of an interior bright feature.
+Its halo moves by one pixel when the source moves by one pixel, rather than remaining
+locked to a two-pixel extraction cell. Only the extracted light is filtered.
+Diffraction-shaped horizontal, vertical and diagonal taps retain their existing
+offsets and RGB wavelength scaling, with red wings wider than blue.
+
+Symmetric kernels reflect at pixel-cell boundaries rather than replicating a bright
+edge. For odd dimensions, the final coarse row or column represents one fine pixel
+instead of two. Each coarse cell therefore carries its actual covered area `A`.
+Restriction and bilinear reconstruction use matching footprints; a symmetric
+neighbor exchange from cell `j` to cell `i` is multiplied by `min(1, A_j / A_i)`,
+with unused weight retained at `i`. This satisfies detailed balance and preserves
+constant fields, nonnegative weights and area-weighted channel sums without a
+global brightness correction. Even dimensions retain the ordinary equal-area path.
+
+With chromatic lens warping and radial shafts bypassed, the complete extraction,
+Gaussian/glare, reconstruction and source-recombination path preserves each HDR
+channel's finite-image sum to floating-point tolerance. Regression fixtures check
+interior, edge and corner impulses on even, odd and tiny grids, including 121×81,
+1×1, 1×9 and 9×1; they sum the actual reconstructed HDR image, not an assumed four
+pixels per coarse cell. Chromatic lens warping and the separate directional radial
+shaft approximation are not flux-conserving operators. Neither the complete
+post-processing pipeline nor these finite kernels constitute a full aperture
+diffraction or physical photon-transport solver.
 
 The pupil's bounded exposure range is 0.4–6.4; extra dark-scene headroom replaces
 the prior 2.5 upper limit. The 2.5 reference used for the pre-existing aperture-size
 effect is retained, so exposure headroom does not enlarge that effect by itself.
 Exposure remains display adaptation, not a water light source.
 
-The subjective layer uses three independent histories of pupil-exposed HDR light.
-The current scene meters the pupil, that exposure multiplies incoming linear
+The subjective layer uses three independent histories of unwarped linear HDR light.
+In the terminal, the current scene meters the pupil, that exposure multiplies incoming
 light, and only then do the histories accumulate it. The final grade applies no
-second pupil multiplier. Opening the pupil in a dark view therefore cannot amplify
-a remembered bright frame. Creative scene exposure remains part of the grade.
-Each reservoir follows the unwarped current image with
+second pupil multiplier. Opening the pupil in a dark terminal view therefore cannot
+amplify a remembered bright frame. The native Metal and desktop GPU paths instead
+store scene HDR and apply the current pupil exposure once after history mixing, before
+tone mapping. Creative scene exposure remains part of the grade.
+Each reservoir follows the current image with
 
 ```text
 H_new = H_old + (I - H_old) × alpha
 alpha = 1 - exp(-ln(2) × dt / half_life)
 ```
 
-The half-lives are fixed at 0.10, 0.35 and 0.80 active wall seconds. All three RGB
-channels use the same half-life within a reservoir: neutral history does not
-change hue as it decays. Dose changes displayed weights, not stored age.
-Exponential integration is exact for a constant input and independent of its
-frame partition. Spatially transformed output never feeds back into these
-reservoirs or temporal antialiasing.
+Rising luminance selects attack half-lives of 0.025, 0.050 and 0.090 active wall
+seconds; otherwise release half-lives are 0.24, 0.72 and 1.65 seconds. The comparison
+is between current and stored Rec.709 luminance at each pixel. All three RGB channels
+share the selected coefficient within a reservoir: neutral history does not change
+hue as it decays. This captures short glints quickly while leaving a longer coloured
+tail. Dose changes displayed weights, not stored age. For a constant input, luminance
+approaches its target monotonically, so exponential integration is exact and independent
+of frame partition. Spatially transformed output never feeds back into these reservoirs
+or temporal antialiasing.
+
+The native Metal and desktop GPU paths update all three reservoirs in one compute pass.
+They share an exact source-pixel area average: each source texel contributes according
+to its overlap with the destination footprint, including fractional scale ratios and
+image borders. This avoids losing tiny highlights between sparse samples at large
+reductions. The filter preserves constant fields and area-weighted radiance; its work
+scales with source plus history pixels. Six RGBA16-float ping-pong textures start at
+half the drawable dimensions, capped at 350,000 pixels each (16.8 MB total). Their size
+depends on the drawable, so changes in scene render quality preserve both their storage
+and accumulated age. A real drawable resize reallocates and seeds them from current light.
 
 The subjective clock `t` advances with accepted active wall time, independently
 of simulation speed. With Trip `D` and subjective setting `S`, its smooth dose is
@@ -374,11 +470,14 @@ dose = S × clamp(D / 4, 0, 2) × envelope(t)
 ```
 
 The envelope stays in `[0.44, 1]`; it has no random per-frame flashing. A zero-time
-redraw advances neither the effect clock nor the reservoirs. Pause and help
-supply zero elapsed wall time. A renderer gap longer than 0.25 seconds discards
-retinal history and does not advance the effect phase. Scene changes and terminal
-resize also invalidate history without resetting that phase. An internal quality
-resize can resample the valid reservoirs while preserving their ages.
+redraw advances neither the effect clock nor already valid reservoirs. Pause and help
+supply zero elapsed wall time; GPU hosts also exclude occluded time when resuming.
+A slow active frame integrates its actual elapsed time, even beyond 0.25 seconds,
+without automatically discarding history. Explicit scene discontinuities and terminal
+resize invalidate history without resetting the effect phase. A terminal internal-quality
+resize can resample valid reservoirs while preserving their ages; GPU quality changes
+keep their existing allocation. Invalid history is seeded from current light, including
+on a held redraw, so an explicit reset cannot expose uninitialized or stale samples.
 
 Displayed histories have independent small translations and spatial bends in
 display-pixel units. They do not rotate or zoom the whole image. Their amplitude
@@ -387,9 +486,9 @@ coefficients; this history warp is distinct from the direct RGB-radius ceiling.
 Each layer uses three bilinear channel samples. Frame, row and column
 oscillators are cached, so the pixel loop does not evaluate trigonometric waves.
 
-Layer weights start at `[0.10, 0.105, 0.075] × min(dose, 1.7)`. Each is multiplied
+Layer weights start at `[0.12, 0.11, 0.09] × min(dose, 1.7)`. Each is multiplied
 by a nonnegative color-affinity factor no greater than one. Their sum is at most
-0.476, leaving at least 52.4% current light before subsequent effects. Affinity
+0.544, leaving at least 45.6% current light before subsequent effects. Affinity
 reduces incompatible chromaticities and separately rejects bright neutral history
 that would bleach visible saturated current colors. Its protection fades near
 black, preserving colored afterimages over a dark current view. This is a deliberate
@@ -398,14 +497,15 @@ model. Exponential updates, bilinear samples and history mixing remain convex;
 constant fields stay unchanged and this history stage introduces no additive HDR
 gain. Spatial warps and clamped history boundaries do not conserve integrated light.
 
-`e`, zero Trip and zero LSD bypass the subjective stages. Disabling persistence
-invalidates its reservoirs, so re-enabling cannot reveal stale light. The separate
-scene bloom/glare, thin-film response and bed illumination retain their own controls.
+`e`, zero Trip and zero LSD bypass the subjective stages. In the terminal, disabling
+persistence invalidates its reservoirs, so re-enabling cannot reveal stale light.
+The GPU paths continue tracking raw scene light while subjective effects are bypassed.
+The separate scene bloom/glare, thin-film response and bed illumination retain their own controls.
 These distinctions matter: disabling LSD does not remove the scene's authored
 psychedelic lighting or change its hydraulic simulation.
 
-After persistence, a sparse retinal point-spread function operates on the exposed
-HDR image. It has a central sample and four symmetric lobes on the horizontal and
+In the terminal, after persistence a sparse retinal point-spread function operates on
+the exposed HDR image. It has a central sample and four symmetric lobes on the horizontal and
 vertical axes. Representative RGB wavelengths `[650, 550, 460]` nm set their radii
 to `6 × wavelength / 550` display pixels. Their total weight is
 `0.13 × min(dose, 1.7)`, with the remainder at the centre. Positive normalized
@@ -446,18 +546,22 @@ rotation without per-pixel trigonometry or allocation. This preserves luminance
 at this stage, not each channel's integral or a perceptually uniform color difference.
 It is an artistic adaptation pattern rather than a solved retinal response.
 
-The complete perception order is pupil exposure → unwarped HDR reservoirs and
+The terminal perception order is pupil exposure → unwarped HDR reservoirs and
 displayed history mixture → normalized retinal PSF → output-grid reconstruction
 and vignette → RGB reassembly → subjective chroma adaptation → common tone/gamut
 mapping → sRGB. Existing bloom/glare precedes this sequence; its approximate
 conservation limits are separate from the normalized retinal PSF. Neither the
 complete subjective pipeline nor final tone mapping is claimed to conserve a
-scene's physical radiant flux.
+scene's physical radiant flux. The temporal echoes, drifting channels and chroma
+adaptation are authored perceptual effects, not a validated biological model of LSD.
+They do not alter fluid dynamics, pigment transport or the scene's optical coefficients.
 
 `i` controls a separate presentation stage. A bounded worker stores completed,
 timestamped display frames and linearly interpolates their decoded sRGB values
 at the requested display cadence. It adds roughly two source-frame intervals of
-latency (33–150 ms) to provide intermediate frames. This is an image crossfade,
+latency (33–500 ms) to provide intermediate frames. The reserve covers both the
+source-frame interval and the measured age on arrival; it grows immediately when
+needed and shrinks gradually. This is an image crossfade,
 not new hydrodynamic states or optical-flow reconstruction. Its samples never
 feed back into the renderer or into the RGB echo histories. Pause, help, resize
 and mode changes of the presenter reset its history. Displayed frame rate and

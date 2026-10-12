@@ -9,6 +9,10 @@
 @group(0) @binding(6) var retinaMiddle: texture_2d<f32>;
 @group(0) @binding(7) var retinaSlow: texture_2d<f32>;
 @group(0) @binding(8) var retinaNext: texture_storage_2d<rgba16float,write>;
+@group(0) @binding(9) var retinaNextMiddle: texture_storage_2d<rgba16float,write>;
+@group(0) @binding(10) var retinaNextSlow: texture_storage_2d<rgba16float,write>;
+struct RetinaUpdateParameters { attack: vec4f, release: vec4f }
+@group(0) @binding(11) var<uniform> retinaUpdate: RetinaUpdateParameters;
 const RETINA_PI: f32=3.14159265358979323846;
 const LUMA: vec3f=vec3f(0.2126,0.7152,0.0722);
 struct RetinaVertexOut {
@@ -33,17 +37,51 @@ fn toneMap(hdr: vec3f, exposure: f32, u: Uniforms) -> vec3f {
     tone=clamp(tone+(u.gain.w-1.0)*tone*(1.0-tone)*(tone-0.18),0.0,0.9995);
     return rgb*(tone/peak);
 }
-// During this entry point state=(alpha,priorValid,0,0), not the post state.
+// Exact area-weighted restriction of piecewise-constant radiance. The complete
+// footprint is covered at every scale, including fractional pixel boundaries.
+// Total work is O(source pixels + output pixels); tiny glints cannot fall into
+// gaps between a fixed set of downsampling taps.
+fn retinaAreaAverage(current: texture_2d<f32>, p: vec2u, outputSize: vec2u) -> vec3f {
+    let size=textureDimensions(current);
+    let scale=vec2f(size)/vec2f(outputSize);
+    let lo=vec2f(p)*scale;
+    let hi=min(vec2f(p+vec2u(1))*scale,vec2f(size));
+    let first=min(vec2u(floor(lo)),size-vec2u(1));
+    let end=min(vec2u(ceil(hi)),size);
+    var sum=vec3f(0.0);
+    for (var y=first.y; y < end.y; y += 1u) {
+        let wy=max(0.0,min(hi.y,f32(y+1u))-max(lo.y,f32(y)));
+        for (var x=first.x; x < end.x; x += 1u) {
+            let wx=max(0.0,min(hi.x,f32(x+1u))-max(lo.x,f32(x)));
+            sum += max(textureLoad(current,vec2i(i32(x),i32(y)),0).rgb,vec3f(0.0))*(wx*wy);
+        }
+    }
+    return sum/max((hi.x-lo.x)*(hi.y-lo.y),1e-12);
+}
+fn retinaIntegrate(now: vec3f, old: vec3f, attack: f32, release: f32) -> vec3f {
+    if (!finite3(old)) { return now; }
+    let alpha=select(release,attack,dot(now,LUMA) > dot(old,LUMA));
+    return mix(old,now,clamp(alpha,0.0,1.0));
+}
+// All layers share the source filter. attack.w is prior-valid; the RGB alpha
+// is chosen by luminance and shared across channels to preserve captured hue.
 @compute @workgroup_size(8,8,1) fn retinaHistoryUpdate(@builtin(global_invocation_id) id: vec3u) {
     let p=id.xy;
     let size=textureDimensions(retinaNext);
     if (any(p >= size)) { return; }
-    let uv=(vec2f(p)+vec2f(0.5))/vec2f(size);
-    let now=max(sample_clamp2(retinaCurrent,uv).rgb,vec3f(0.0));
-    if (retinaState.y <= 0.0) { textureStore(retinaNext,vec2i(p),vec4f(now,1.0)); return; }
-    var old=sample_clamp2(retinaPrevious,uv).rgb;
-    if (!finite3(old)) { old=now; }
-    textureStore(retinaNext,vec2i(p),vec4f(mix(old,now,clamp(retinaState.x,0.0,1.0)),1.0));
+    let now=retinaAreaAverage(retinaCurrent,p,size);
+    if (retinaUpdate.attack.w <= 0.0) {
+        textureStore(retinaNext,vec2i(p),vec4f(now,1.0));
+        textureStore(retinaNextMiddle,vec2i(p),vec4f(now,1.0));
+        textureStore(retinaNextSlow,vec2i(p),vec4f(now,1.0));
+        return;
+    }
+    let a=retinaIntegrate(now,textureLoad(retinaFast,vec2i(p),0).rgb,retinaUpdate.attack.x,retinaUpdate.release.x);
+    let b=retinaIntegrate(now,textureLoad(retinaMiddle,vec2i(p),0).rgb,retinaUpdate.attack.y,retinaUpdate.release.y);
+    let c=retinaIntegrate(now,textureLoad(retinaSlow,vec2i(p),0).rgb,retinaUpdate.attack.z,retinaUpdate.release.z);
+    textureStore(retinaNext,vec2i(p),vec4f(a,1.0));
+    textureStore(retinaNextMiddle,vec2i(p),vec4f(b,1.0));
+    textureStore(retinaNextSlow,vec2i(p),vec4f(c,1.0));
 }
 fn retinaHistoryChromaRetention(now: vec3f, old: vec3f) -> f32 {
     let peak=max(now.x,max(now.y,now.z));
@@ -102,7 +140,7 @@ fn retinaTemporal(current: texture_2d<f32>, previous: texture_2d<f32>,
         dot(direction,normalize(c+vec3f(0.001)))));
     affinity *= vec3f(retinaHistoryChromaRetention(now,a),retinaHistoryChromaRetention(now,b),
                       retinaHistoryChromaRetention(now,c));
-    let weights=vec3f(0.10,0.105,0.075)*min(dose,1.7)*affinity;
+    let weights=vec3f(0.12,0.11,0.09)*min(dose,1.7)*affinity;
     return now*(1.0-dot(weights,vec3f(1.0)))+a*weights.x+b*weights.y+c*weights.z;
 }
 fn retinaChroma(color: vec3f, contrast: f32, uv: vec2f, state: vec4f, dose: f32) -> vec3f {

@@ -47,21 +47,23 @@ struct PresentationClock {
 
 struct RetinaHistoryStep {
     let time: Float
-    let alphas: SIMD3<Float>
+    let attackAlphas: SIMD3<Float>
+    let releaseAlphas: SIMD3<Float>
     let update: Bool
     let seed: Bool
 }
 
 /// Stores only radiometric history. Spatial and RGB distortions are output-only.
 struct RetinaHistoryPolicy {
-    static let halfLives = [0.10, 0.35, 0.80]
+    static let attackHalfLives = [0.025, 0.050, 0.090]
+    static let releaseHalfLives = [0.24, 0.72, 1.65]
     private var valid = false
     private var time = 0.0
 
     mutating func invalidate() { valid = false }
 
     static func alpha(delta: Double, halfLife: Double) -> Double {
-        -expm1(-log(2) * max(0, delta) / halfLife)
+        -expm1(-log(2) * (delta.isFinite ? max(0, delta) : 0) / halfLife)
     }
 
     static func extent(width: Int, height: Int) -> RenderExtent {
@@ -72,17 +74,20 @@ struct RetinaHistoryPolicy {
     }
 
     mutating func advance(delta: Double, held: Bool) -> RetinaHistoryStep {
-        let gap = !held && delta > 0.25
-        if gap { valid = false }
-        let activeDelta = held || gap ? 0 : max(0, delta)
+        // The host explicitly excludes hidden/held time. A slow active frame
+        // still ages the retina; discarding it would abruptly erase its trails.
+        let activeDelta = held || !delta.isFinite ? 0 : max(0, delta)
         time += activeDelta
         let seed = !valid
         let update = seed || activeDelta > 0
-        let alphas = seed ? SIMD3<Float>(repeating: 1) : SIMD3<Float>(
-            Float(Self.alpha(delta: activeDelta, halfLife: Self.halfLives[0])),
-            Float(Self.alpha(delta: activeDelta, halfLife: Self.halfLives[1])),
-            Float(Self.alpha(delta: activeDelta, halfLife: Self.halfLives[2])))
+        func coefficients(_ halfLives: [Double]) -> SIMD3<Float> {
+            seed ? SIMD3<Float>(repeating: 1) : SIMD3<Float>(
+                Float(Self.alpha(delta: activeDelta, halfLife: halfLives[0])),
+                Float(Self.alpha(delta: activeDelta, halfLife: halfLives[1])),
+                Float(Self.alpha(delta: activeDelta, halfLife: halfLives[2])))
+        }
         if update { valid = true }
-        return RetinaHistoryStep(time: Float(time), alphas: alphas, update: update, seed: seed)
+        return RetinaHistoryStep(time: Float(time), attackAlphas: coefficients(Self.attackHalfLives),
+                                 releaseAlphas: coefficients(Self.releaseHalfLives), update: update, seed: seed)
     }
 }

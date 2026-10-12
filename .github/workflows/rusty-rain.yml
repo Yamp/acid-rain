@@ -191,6 +191,41 @@ jobs:
       - name: Build original native Metal app on Apple Silicon
         if: matrix.target == 'aarch64-apple-darwin'
         run: ./native/build.sh 2>&1 | tee artifacts/native-build.log
+      - name: Compile and exercise native optical contracts when Metal is available
+        if: runner.os == 'macOS'
+        run: |
+          native_tests_dir="$RUNNER_TEMP/acid-rain-native-tests"
+          mkdir -p "$native_tests_dir"
+          xcrun swiftc -O -parse-as-library -import-objc-header native/include/AcidRainCore.h \
+            native/Tests/OpticalSamplingTests.swift -o "$native_tests_dir/optical-sampling" \
+            2>&1 | tee artifacts/native-optical-compile.log
+          xcrun swiftc -O -parse-as-library -import-objc-header native/include/AcidRainCore.h \
+            native/Tests/RetinaTests.swift -o "$native_tests_dir/retina" \
+            2>&1 | tee artifacts/native-retina-compile.log
+          cat > "$native_tests_dir/metal-probe.swift" <<'SWIFT'
+          import Foundation
+          import Metal
+          guard let device = MTLCreateSystemDefaultDevice() else {
+              print("SKIPPED: this macOS runner exposes no Metal device; native GPU execution was not verified.")
+              exit(77)
+          }
+          print("Metal device: \(device.name)")
+          SWIFT
+          if xcrun swift "$native_tests_dir/metal-probe.swift" > artifacts/native-metal-device.log 2>&1; then
+            cat artifacts/native-metal-device.log
+          else
+            probe_status=$?
+            cat artifacts/native-metal-device.log
+            if [[ "$probe_status" == 77 ]]; then
+              cp artifacts/native-metal-device.log artifacts/native-metal-SKIPPED.txt
+              exit 0
+            fi
+            exit "$probe_status"
+          fi
+          "$native_tests_dir/optical-sampling" artifacts/native-optical-sampling \
+            2>&1 | tee artifacts/native-optical-tests.log
+          "$native_tests_dir/retina" 2>&1 | tee artifacts/native-retina-tests.log
+          cp -R native/artifacts/retina-checks artifacts/native-retina
       - name: Verify release version
         env:
           RELEASE_VERSION: ${{ inputs.release-version }}

@@ -121,6 +121,12 @@ fn sample_extended_surface(
 }
 
 #[derive(Debug)]
+struct PhysicalWaveCache {
+    key: (u32, u32, usize, usize),
+    wave: Option<RadialWave>,
+}
+
+#[derive(Debug)]
 pub struct WaveCenter {
     pub x: f32,
     pub y: f32,
@@ -128,6 +134,7 @@ pub struct WaveCenter {
     pub size: f32,
     pub time: Instant,
     physical: Option<PressureImpact>,
+    physical_cache: Option<Box<PhysicalWaveCache>>,
 }
 
 impl WaveCenter {
@@ -144,6 +151,7 @@ impl WaveCenter {
             size: 1.0,
             time,
             physical: None,
+            physical_cache: None,
         }
     }
 }
@@ -803,26 +811,25 @@ impl Water {
         }
         levels.copy_from_slice(&self.advected_levels);
         let lifetime = SETTINGS.attenuation_time.as_secs_f32();
-        for center in &self.wave_centers {
-            if center.physical.is_some() {
-                continue;
-            }
-            let age = self
-                .time
-                .saturating_duration_since(center.time)
-                .as_secs_f32();
-            let wave = if center.size == 1.0 {
-                RadialWave::for_grid(center.strength, age, lifetime, width, height)
-            } else {
-                RadialWave::for_grid_sized(
+        let sources: Vec<_> = self
+            .wave_centers
+            .iter()
+            .filter(|center| center.physical.is_none())
+            .collect();
+        let requests: Vec<_> = sources
+            .iter()
+            .map(|center| {
+                (
                     center.strength,
                     center.size,
-                    age,
-                    lifetime,
-                    width,
-                    height,
+                    self.time
+                        .saturating_duration_since(center.time)
+                        .as_secs_f32(),
                 )
-            };
+            })
+            .collect();
+        let profiles = RadialWave::for_grid_waves(&requests, lifetime, width, height);
+        for ((center, &(_, _, age)), wave) in sources.into_iter().zip(&requests).zip(profiles) {
             let Some(wave) = wave else {
                 continue;
             };
@@ -864,10 +871,19 @@ impl Water {
     }
 
     fn resolve_physical_impacts(&mut self) {
+        if !self
+            .wave_centers
+            .iter()
+            .any(|center| center.physical.is_some())
+        {
+            return;
+        }
         let width = self.width() as usize;
         let height = self.height() as usize;
         let lifetime = SETTINGS.attenuation_time.as_secs_f32();
-        for center in &self.wave_centers {
+        let mut requests = Vec::new();
+        let mut missing = Vec::new();
+        for (index, center) in self.wave_centers.iter().enumerate() {
             let Some(impact) = center.physical else {
                 continue;
             };
@@ -875,24 +891,110 @@ impl Water {
                 .time
                 .saturating_duration_since(center.time)
                 .as_secs_f32();
-            let Some(wave) = RadialWave::for_pressure_impact(impact, age, lifetime, width, height)
+            let key = (age.to_bits(), lifetime.to_bits(), width, height);
+            if center
+                .physical_cache
+                .as_ref()
+                .is_none_or(|cache| cache.key != key)
+            {
+                requests.push((impact, age));
+                missing.push((index, key));
+            }
+        }
+        // Reuse only the radial transform, never the spatial field. New contacts,
+        // expired/evicted sources and world recentering still rebuild the field.
+        // At a fixed physical instant the transform depends only on immutable
+        // impact parameters, age, lifetime and the grid's spectral cutoff.
+        let profiles = RadialWave::for_pressure_impacts(&requests, lifetime, width, height);
+        for ((index, key), wave) in missing.into_iter().zip(profiles) {
+            let value = PhysicalWaveCache { key, wave };
+            match &mut self.wave_centers[index].physical_cache {
+                Some(cache) => **cache = value,
+                slot @ None => *slot = Some(Box::new(value)),
+            }
+        }
+        let levels = self
+            .levels
+            .as_slice_mut()
+            .expect("water field is contiguous");
+        let mut dy_squared = vec![0.0; height];
+        for center in &self.wave_centers {
+            let Some(wave) = center
+                .physical_cache
+                .as_ref()
+                .and_then(|cache| cache.wave.as_ref())
             else {
                 continue;
             };
+            for (y, distance2) in dy_squared.iter_mut().enumerate() {
+                let dy = y as f32 / height as f32 - center.y;
+                *distance2 = dy * dy;
+            }
             for x in 0..width {
                 let dx = x as f32 / width as f32 - center.x;
-                for y in 0..height {
-                    let dy = y as f32 / height as f32 - center.y;
-                    let eta = wave.sample((dx * dx + dy * dy).sqrt());
-                    let i = x * height + y;
-                    self.levels[[x, y]] += eta;
+                let dx2 = dx * dx;
+                let offset = x * height;
+                let column = &mut levels[offset..offset + height];
+                let depths = &mut self.depths[offset..offset + height];
+                for (y, (level, depth)) in column.iter_mut().zip(depths).enumerate() {
+                    let eta = wave.sample((dx2 + dy_squared[y]).sqrt());
+                    *level += eta;
                     // Same geometric displacement in height and depth preserves
                     // bed elevation. The conservative hydro state and its fluxes
                     // are untouched by this linear small-wave closure.
-                    self.depths[i] += eta;
+                    *depth += eta;
                 }
             }
         }
+    }
+
+    /// Interpolating geometry shared by native contact and GPU ray optics.
+    /// Coordinates are normalized to the resident patch; derivatives are per
+    /// metre. Clamped ghost samples match the Metal/WGSL tensor Catmull-Rom.
+    pub(crate) fn sample_cubic_surface(
+        &self,
+        point: [f32; 2],
+    ) -> [f32; 3] {
+        let width = self.width() as usize;
+        let height = self.height() as usize;
+        if width == 0
+            || height == 0
+            || !point
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        {
+            return [0.0; 3];
+        }
+        let p = [point[0] * width as f32, point[1] * height as f32];
+        let cell = p.map(|value| value.floor() as isize);
+        let t = [p[0] - cell[0] as f32, p[1] - cell[1] as f32];
+        let coefficients = |h: [f32; 4]| {
+            [
+                0.5 * (-h[0] + 3.0 * h[1] - 3.0 * h[2] + h[3]),
+                h[0] - 2.5 * h[1] + 2.0 * h[2] - 0.5 * h[3],
+                0.5 * (h[2] - h[0]),
+                h[1],
+            ]
+        };
+        let mut values = [0.0; 4];
+        let mut dx = [0.0; 4];
+        for row in 0..4 {
+            let y = (cell[1] + row as isize - 1).clamp(0, height as isize - 1) as usize;
+            let samples = std::array::from_fn(|column| {
+                let x = (cell[0] + column as isize - 1).clamp(0, width as isize - 1) as usize;
+                self.levels[[x, y]]
+            });
+            let a = coefficients(samples);
+            values[row] = ((a[0] * t[0] + a[1]) * t[0] + a[2]) * t[0] + a[3];
+            dx[row] = (3.0 * a[0] * t[0] + 2.0 * a[1]) * t[0] + a[2];
+        }
+        let a = coefficients(values);
+        let b = coefficients(dx);
+        [
+            ((a[0] * t[1] + a[1]) * t[1] + a[2]) * t[1] + a[3],
+            (((b[0] * t[1] + b[1]) * t[1] + b[2]) * t[1] + b[3]) * width as f32 / PATCH_LENGTH,
+            ((3.0 * a[0] * t[1] + 2.0 * a[1]) * t[1] + a[2]) * height as f32 / PATCH_LENGTH,
+        ]
     }
 
     /// Native ballistic contact. Inputs use metres, m/s, and physical time.
@@ -916,19 +1018,20 @@ impl Water {
         {
             return;
         }
-        let x0 = (point[0] - 1.0 / width as f32).max(0.0);
-        let x1 = (point[0] + 1.0 / width as f32).min((width - 1) as f32 / width as f32);
-        let y0 = (point[1] - 1.0 / height as f32).max(0.0);
-        let y1 = (point[1] + 1.0 / height as f32).min((height - 1) as f32 / height as f32);
-        let values = self.levels.as_slice().unwrap();
-        let sx = (sample_surface(values, width, height, x1, point[1])
-            - sample_surface(values, width, height, x0, point[1]))
-            / ((x1 - x0) * PATCH_LENGTH).max(f32::EPSILON);
-        let sy = (sample_surface(values, width, height, point[0], y1)
-            - sample_surface(values, width, height, point[0], y0))
-            / ((y1 - y0) * PATCH_LENGTH).max(f32::EPSILON);
+        let [surface, sx, sy] = self.sample_cubic_surface(point);
         let normal_speed = vertical_speed / (1.0 + sx * sx + sy * sy).sqrt();
-        let depth = sample_surface(&self.depths, width, height, point[0], point[1]);
+        // The bed remains bilinear height minus bilinear depth. Only the tiny
+        // reconstruction offset changes the wet column under the cubic surface.
+        let bilinear_height = sample_surface(
+            self.levels.as_slice().unwrap(),
+            width,
+            height,
+            point[0],
+            point[1],
+        );
+        let depth = (sample_surface(&self.depths, width, height, point[0], point[1]) + surface
+            - bilinear_height)
+            .max(0.001);
         let Some(impact) = PressureImpact::new(radius, normal_speed, depth) else {
             return;
         };
@@ -1110,6 +1213,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cubic_surface_preserves_metric_planes_saddles_and_resolved_node_amplitudes() {
+        let mut water = Water::new(32, 24);
+        for curved in [false, true] {
+            for ix in 0..32 {
+                for iy in 0..24 {
+                    let x = ix as f32 * PATCH_LENGTH / 32.0;
+                    let y = iy as f32 * PATCH_LENGTH / 24.0;
+                    let height = 0.3
+                        + 0.04 * x
+                        + 0.07 * y
+                        + if curved {
+                            0.02 * x * y + 0.03 * x * x - 0.04 * y * y
+                        } else {
+                            0.0
+                        };
+                    water.levels[[ix, iy]] = height;
+                }
+            }
+            for point in [[0.25, 0.5], [0.37, 0.61], [0.72, 0.27]] {
+                let [x, y] = point.map(|value| value * PATCH_LENGTH);
+                let expected = [
+                    0.3 + 0.04 * x
+                        + 0.07 * y
+                        + if curved {
+                            0.02 * x * y + 0.03 * x * x - 0.04 * y * y
+                        } else {
+                            0.0
+                        },
+                    0.04 + if curved { 0.02 * y + 0.06 * x } else { 0.0 },
+                    0.07 + if curved { 0.02 * x - 0.08 * y } else { 0.0 },
+                ];
+                for (actual, expected) in
+                    water.sample_cubic_surface(point).into_iter().zip(expected)
+                {
+                    assert!(
+                        (actual - expected).abs() < 3e-6,
+                        "{point:?}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+        for x in 0..32 {
+            for y in 0..24 {
+                water.levels[[x, y]] = 0.025 * (TAU * x as f32 / 3.0).cos();
+            }
+        }
+        for x in 1..31 {
+            let actual = water.sample_cubic_surface([x as f32 / 32.0, 0.5])[0];
+            assert_eq!(
+                actual,
+                water.levels[[x, 12]],
+                "resolved wave node lost amplitude"
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_surface_uses_finite_clamped_ghost_samples_at_patch_edges() {
+        let mut water = Water::new(8, 6);
+        for x in 0..8 {
+            for y in 0..6 {
+                water.levels[[x, y]] = x as f32 * 0.25;
+            }
+        }
+        assert_eq!(water.sample_cubic_surface([0.0, 0.5]), [0.0, 0.5, 0.0]);
+        assert_eq!(water.sample_cubic_surface([1.0, 0.5]), [1.75, 0.0, 0.0]);
+        // The last resident cell has repeated right-hand ghost samples, not a
+        // coordinate clamped prematurely to the final lattice node.
+        let edge = water.sample_cubic_surface([7.5 / 8.0, 0.5]);
+        assert!((edge[0] - 1.765625).abs() < 1e-7);
+        assert!((edge[1] + 0.125).abs() < 1e-7);
+        for height in [0.0, -0.3, 0.2] {
+            water.levels.fill(height);
+            for point in [[0.0, 0.0], [1.0, 1.0], [0.37, 0.91]] {
+                let surface = water.sample_cubic_surface(point);
+                assert!(surface.iter().all(|value| value.is_finite()));
+                assert!((surface[0] - height).abs() < 1e-7);
+                assert!(surface[1].abs() < 1e-6 && surface[2].abs() < 1e-6);
+            }
+        }
+        assert_eq!(Water::new(0, 0).sample_cubic_surface([0.5, 0.5]), [0.0; 3]);
+    }
+
+    #[test]
+    fn ballistic_pressure_uses_the_same_cubic_normal_and_wet_column() {
+        let mut water = Water::new(32, 24);
+        water.levels.fill(0.0);
+        water.depths.fill(0.7);
+        for y in 0..24 {
+            water.levels[[12, y]] = 0.08;
+            water.levels[[14, y]] = 0.02;
+        }
+        let point = [12.25 / 32.0, 0.5];
+        // Independent polynomial of the samples [0,.08,0,.02].
+        let surface = 0.13 * 0.25_f32.powi(3) - 0.21 * 0.25_f32.powi(2) + 0.08;
+        let sx = (3.0 * 0.13 * 0.25_f32.powi(2) - 2.0 * 0.21 * 0.25) * 16.0;
+        let expected =
+            PressureImpact::new(0.00825, 2.9 / (1.0 + sx * sx).sqrt(), 0.7 + surface - 0.06)
+                .unwrap();
+        water.add_ballistic_drop(point, 0.00825, 2.9, Duration::ZERO);
+        let actual = water.wave_centers[0].physical.unwrap();
+        for age in [0.01, 0.1, 0.4] {
+            let actual = RadialWave::for_pressure_impact(actual, age, 10.0, 32, 24).unwrap();
+            let expected = RadialWave::for_pressure_impact(expected, age, 10.0, 32, 24).unwrap();
+            for radius in [0.0, 0.03, 0.2] {
+                assert!((actual.sample(radius) - expected.sample(radius)).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
     fn native_column_current_uses_rapids_momentum_and_keeps_classic_current() {
         let mut water = Water::new(48, 32);
         water.configure_world(37, true);
@@ -1176,6 +1390,50 @@ mod tests {
             assert!(!uncolored.has_dye());
             assert!(uncolored.dye.iter().all(|value| *value == [0.0; 3]));
         }
+    }
+
+    #[test]
+    fn ballistic_profile_cache_reuses_only_unchanged_time_and_grid() {
+        let mut water = Water::new(48, 32);
+        water.set_current(false);
+        water.update(Duration::from_millis(480));
+        water.add_ballistic_drop([0.5, 0.5], 0.00825, 2.9, Duration::from_millis(6));
+        water.update(Duration::ZERO);
+        let once = water.levels.clone();
+        let built = crate::waves::profile_build_count();
+        water.update(Duration::ZERO);
+        assert_eq!(water.levels, once);
+        assert_eq!(
+            crate::waves::profile_build_count(),
+            built,
+            "same-time display/contact refresh must reuse the radial transform"
+        );
+
+        water.add_ballistic_drop([0.6, 0.4], 0.012, 2.9, Duration::from_millis(4));
+        water.update(Duration::ZERO);
+        assert_eq!(
+            crate::waves::profile_build_count(),
+            built + 1,
+            "a new contact must build only its own profile"
+        );
+        let before_step = crate::waves::profile_build_count();
+        water.update(Duration::from_millis(16));
+        assert_eq!(
+            crate::waves::profile_build_count(),
+            before_step + 2,
+            "advancing physical time must rebuild both profiles"
+        );
+
+        // Test resolution invalidation without also changing physical time.
+        water.levels = Array2::zeros((64, 48));
+        water.depths.resize(64 * 48, DEPTH);
+        let before_resize = crate::waves::profile_build_count();
+        water.resolve_physical_impacts();
+        assert_eq!(
+            crate::waves::profile_build_count(),
+            before_resize + 2,
+            "a changed Nyquist filter requires rebuilding both profiles"
+        );
     }
 
     #[test]

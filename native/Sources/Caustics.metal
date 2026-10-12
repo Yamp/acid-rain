@@ -1,6 +1,44 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Interpolating tensor Catmull--Rom surface. Geometry, its analytic normal and
+// forward caustic refraction share this polynomial. Each patch loads its sixteen
+// height samples once; local ray refinement reuses those coefficients.
+struct WaterSurfacePatch { float4 rows[4]; int2 cell; float2 scale; };
+float4 waterCubicCoefficients(float4 h) {
+    return float4(.5f*(-h.x+3*h.y-3*h.z+h.w),
+                  h.x-2.5f*h.y+2*h.z-.5f*h.w,.5f*(h.z-h.x),h.y);
+}
+WaterSurfacePatch waterSurfacePatch(texture2d<float> water,float2 metres,float extent=2.f) {
+    int2 size=int2(water.get_width(),water.get_height());
+    float2 scale=float2(size)/extent;
+    int2 cell=int2(floor(metres*scale));
+    WaterSurfacePatch patch; patch.cell=cell; patch.scale=scale;
+    for (int y=0;y<4;++y) {
+        float4 row;
+        for (int x=0;x<4;++x) row[x]=water.read(uint2(clamp(cell+int2(x-1,y-1),int2(0),size-1))).x;
+        patch.rows[y]=waterCubicCoefficients(row);
+    }
+    return patch;
+}
+float3 waterSurfaceValue(thread const WaterSurfacePatch &patch,float2 metres) {
+    float2 t=metres*patch.scale-float2(patch.cell);
+    float4 value,dx;
+    for (uint y=0;y<4;++y) {
+        float4 a=patch.rows[y];
+        value[y]=((a.x*t.x+a.y)*t.x+a.z)*t.x+a.w;
+        dx[y]=(3*a.x*t.x+2*a.y)*t.x+a.z;
+    }
+    float4 a=waterCubicCoefficients(value),b=waterCubicCoefficients(dx);
+    return float3(((a.x*t.y+a.y)*t.y+a.z)*t.y+a.w,
+        (((b.x*t.y+b.y)*t.y+b.z)*t.y+b.w)*patch.scale.x,
+        ((3*a.x*t.y+2*a.y)*t.y+a.z)*patch.scale.y);
+}
+float3 waterSurface(texture2d<float> water,float2 metres,float extent=2.f) {
+    WaterSurfacePatch patch=waterSurfacePatch(water,metres,extent);
+    return waterSurfaceValue(patch,metres);
+}
+
 // Forward flux transport. Each source cell carries transmitted beam power;
 // its refracted Jacobian shapes a normalized finite footprint on the bed.
 // Irradiance is flux / receiver horizontal area, not an artistic brightness map.
@@ -71,7 +109,7 @@ kernel void causticsMap(texture2d<float> water [[texture(0)]], texture2d<float> 
                         constant CausticsUniforms &u [[buffer(0)]], uint3 p [[thread_position_in_grid]]) {
     if (p.x > u.grid.x || p.y > u.grid.x || p.z >= 3) return;
     float2 source = float2(p.xy) * (u.domain.x / float(max(1u,u.grid.x)));
-    float4 field = causticsField(water, source, u.domain.x);
+    float3 field = waterSurface(water, source, u.domain.x);
     float3 n = normalize(float3(-field.yz, 1));
     float3 l = normalize(u.light.xyz);
     float incidence = dot(n,l);
